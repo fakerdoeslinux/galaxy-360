@@ -1,0 +1,1601 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 519f8e8..60794fe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -179,6 +179,7 @@ add_library(galaxy_native_host STATIC
+     runtime/src/input/raw_mouse_win32.cpp
+     runtime/src/input/rumble_route.cpp
+     runtime/src/native_audio.cpp
++    runtime/src/ui_sounds.cpp
+     runtime/src/audio_device_wasapi.cpp
+     runtime/src/mii_import.cpp
+     runtime/src/mii_formats.cpp
+diff --git a/cmake/archive_deps.cmake b/cmake/archive_deps.cmake
+index bc15be8..940541f 100644
+--- a/cmake/archive_deps.cmake
++++ b/cmake/archive_deps.cmake
+@@ -32,6 +32,12 @@ function(nebula_archive_dep name source)
+     if(CMAKE_OSX_DEPLOYMENT_TARGET)
+         list(APPEND toolchain "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+     endif()
++    # Fedora-style multilibs install static archives into lib64, while the libraries the build links are named
++    # under lib/ below. Windows already installs into lib.
++    set(libdir)
++    if(NOT WIN32)
++        set(libdir "-DCMAKE_INSTALL_LIBDIR=lib")
++    endif()
+     execute_process(
+         COMMAND "${CMAKE_COMMAND}" -S "${source}" -B "${build}" -G "${CMAKE_GENERATOR}"
+                 "-DCMAKE_BUILD_TYPE=Release"
+@@ -40,6 +46,7 @@ function(nebula_archive_dep name source)
+                 "-DCMAKE_PREFIX_PATH=${NEBULA_ARCHIVE_PREFIX}"
+                 "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+                 "-DBUILD_SHARED_LIBS=OFF"
++                ${libdir}
+                 ${toolchain} ${ARGN}
+         RESULT_VARIABLE result OUTPUT_QUIET ERROR_VARIABLE errors)
+     if(NOT result EQUAL 0)
+diff --git a/native/host/host_main.cpp b/native/host/host_main.cpp
+index 41f607e..ccb3bfe 100644
+--- a/native/host/host_main.cpp
++++ b/native/host/host_main.cpp
+@@ -105,6 +105,9 @@ inline bool perf_hint_on_battery() noexcept { return false; }
+ 
+ #include <SDL3/SDL_main.h>
+ #endif
++#if defined(NEBULA_XBOX360)
++#include "../../platform/xbox360/xbox360_platform.h"
++#endif
+ 
+ #include <algorithm>
+ #include <array>
+@@ -2309,6 +2312,25 @@ bool gPipelinesPrepared = false;
+ #endif
+ fs::path gModsProgressFile;
+ 
++// NEBULA_OPTION_FPS: the presents the swap chain got over the renderer's last one-second window, the measure the menu's
++// FRAME RATE row shows (host_window::measured_present_hz), with frame generation's extra presents counted in. Tenths,
++// so 59.9 and 60.0 differ. The renderer counts every present, so this is the picture's rate on the display, not the
++// game's step rate: with interpolation or a frame-rate limit above 60 they differ by design.
++uint32_t sampled_fps_tenths() {
++#if defined(NEBULA_HOST_RENDERER)
++    double hz = galaxy::render::host_window::measured_present_hz.load(std::memory_order_relaxed);
++    if (galaxy::render::frame_generation_running()) {
++        hz *= static_cast<double>(galaxy::render::host_window::upscaler_caps().frames_presented);
++    }
++    if (!(hz > 0.0)) {
++        return 0u;
++    }
++    return static_cast<uint32_t>(hz * 10.0 + 0.5);
++#else
++    return 0;
++#endif
++}
++
+ uint32_t svc_option(void*, uint32_t what) {
+     switch (what) {
+     case NEBULA_OPTION_TEXT_SPEED:
+@@ -2407,6 +2429,14 @@ uint32_t svc_option(void*, uint32_t what) {
+ #else
+         return 0;
+ #endif
++    case NEBULA_OPTION_SHOW_FPS:
++#if defined(NEBULA_HOST_RENDERER)
++        return galaxy::render::get_render_config().show_fps ? 1u : 0u;
++#else
++        return 0;
++#endif
++    case NEBULA_OPTION_FPS:
++        return sampled_fps_tenths();
+     default:
+         return 0;
+     }
+@@ -2893,6 +2923,21 @@ void svc_audio_frame(void*) {
+ #endif
+ }
+ 
++// The settings menu's sounds (ui_sounds.h): the player's own files, played by the host's mixer. Without a renderer there
++// is no device to mix them into, so the game makes its own.
++int svc_ui_sound(void*, uint32_t sound) {
++#if defined(NEBULA_HOST_RENDERER)
++    if (::galaxy::diagnosing(::galaxy::kDiagnoseFileReads)) {
++        std::fprintf(stderr, "[read] menu sound %u at sound frame %llu\n", sound,
++                     static_cast<unsigned long long>(gSoundBlocks.load(std::memory_order_relaxed)));
++    }
++    return gAudio != nullptr && gAudio->ui_sound(sound) ? 1 : 0;
++#else
++    (void)sound;
++    return 0;
++#endif
++}
++
+ // The movie's sound: headless, every frame is taken and dropped.
+ int svc_movie_audio(void*, const void* record, uint32_t size) {
+ #if defined(NEBULA_HOST_RENDERER)
+@@ -3593,6 +3638,14 @@ int main(int argc, char** argv) {
+         return 1;
+     }
+ #endif
++#if defined(NEBULA_XBOX360)
++    // The console (platform/xbox360): the scaler's 1280x720 mode, the memory the frame may still take, and the run's log
++    // on the hard disk. A title that cannot read a video mode has no display to present into.
++    if (!galaxy::host::x360::start()) {
++        return 1;
++    }
++    galaxy::host::x360::open_log("Hdd:\\Nebula\\nebula.log");
++#endif
+ #if defined(NEBULA_HOST_RENDERER) && defined(_WIN32)
+     // A player's start has nowhere to print (a launcher with no terminal, or none): the log goes to logs/latest.log beside the
+     // settings, the last start's to previous.log. A test or a shell capturing the output to a pipe or a file keeps it.
+@@ -3858,6 +3911,7 @@ int main(int argc, char** argv) {
+     services.display_extent = svc_display_extent;
+     services.option = svc_option;
+     services.game_stage = svc_game_stage;
++    services.ui_sound = svc_ui_sound;
+ #if defined(NEBULA_HOST_RENDERER)
+     // The display configuration (in --settings' folder when given), loaded before the window; the settings overlay
+     // reads its frame art from the game files.
+diff --git a/native/include/nebula_game_api.h b/native/include/nebula_game_api.h
+index d997188..518cce0 100644
+--- a/native/include/nebula_game_api.h
++++ b/native/include/nebula_game_api.h
+@@ -24,7 +24,7 @@ extern "C" {
+ #define NEBULA_GAME_API __attribute__((visibility("default")))
+ #endif
+ 
+-#define NEBULA_GAME_API_VERSION 150u
++#define NEBULA_GAME_API_VERSION 151u
+ 
+ /* The game's fixed step: nebula_game_run's loop runs this many steps a second (frame_wait paces them), whatever the
+    display's rate; the host presents each or interpolates between them. */
+@@ -380,6 +380,9 @@ enum {
+                                         (the preparation screen shows) */
+     NEBULA_OPTION_PREPARE_PROGRESS,  /* while NEBULA_OPTION_PREPARATION is 2: its progress, 0 to 10000, never going back */
+     NEBULA_OPTION_DIAGNOSE_SCENE_LOADS, /* --diagnostics scene-loads: 1 logs what each scene change loads */
++    NEBULA_OPTION_SHOW_FPS,            /* 1 when DISPLAY > INTERFACE > FPS COUNTER is on: the game draws the readout */
++    NEBULA_OPTION_FPS,                 /* NEBULA_OPTION_SHOW_FPS's measure: frames presented a second, in tenths,
++                                          smoothed; 0 until it has a measure */
+     NEBULA_OPTION_TOUCH_POINTER,       /* 0 no touch screen, 1 one, 2 the finger has the pointer, 3 and the game is on a
+                                           menu: no pointer shows under a finger there */
+ };
+@@ -888,8 +891,23 @@ typedef struct NebulaHostServices {
+        per loss, then 0. The game asks only while it could open its pause menu, and opens it as the pause button does. A
+        request the game did not take (a cutscene, a wipe) lapses when the window is in front again. */
+     int (*take_pause_request)(void* user);
++    /* A sound of the host's settings menu, from the player's own files beside the game's data (`data/menu-sounds`, one
++       WAV per NEBULA_UI_SOUND_* name): 1 when it plays (the file is there), 0 when the player has none, and the game
++       makes its own. Any thread, and before the audio clock starts. */
++    int (*ui_sound)(void* user, uint32_t sound);
+ } NebulaHostServices;
+ 
++/* The sounds of the settings menu (ui_sound), named after their files in `data/menu-sounds`. */
++enum {
++    NEBULA_UI_SOUND_FOCUS = 0,  /* focus.wav: the highlight arrives at something */
++    NEBULA_UI_SOUND_SELECT,     /* select.wav: a value changes, a mod is dropped */
++    NEBULA_UI_SOUND_PAGE,       /* page.wav: another page */
++    NEBULA_UI_SOUND_OPEN,       /* open.wav: the menu opens */
++    NEBULA_UI_SOUND_CLOSE,      /* close.wav: the menu closes */
++    NEBULA_UI_SOUND_OK,         /* ok.wav: a change is applied */
++    NEBULA_UI_SOUND_NUM,
++};
++
+ 
+ enum {
+     NEBULA_MOVIE_NONE = -1,
+diff --git a/native/math/src/nebula_libc.c b/native/math/src/nebula_libc.c
+index cb8eab8..f1ff892 100644
+--- a/native/math/src/nebula_libc.c
++++ b/native/math/src/nebula_libc.c
+@@ -5,6 +5,18 @@
+ #include <stdint.h>
+ #include <wchar.h>
+ 
++/* glibc declares strchr, strrchr and strstr as type-generic macros in <string.h> (pulled in by nebula_prelude.h); the
++   definitions below are the module's own, as on Windows. */
++#ifdef strchr
++#undef strchr
++#endif
++#ifdef strrchr
++#undef strrchr
++#endif
++#ifdef strstr
++#undef strstr
++#endif
++
+ typedef uint64_t __attribute__((may_alias, aligned(1))) Word;
+ 
+ void* memcpy(void* pDst, const void* pSrc, size_t size) {
+diff --git a/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp b/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
+index 9eaa755..57434d5 100644
+--- a/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
++++ b/native/petari/include/Game/Screen/GameSceneLayoutHolder.hpp
+@@ -10,6 +10,7 @@ class MarioSubMeter;
+ class MissLayout;
+ class NebulaAchievementBoard;
+ class NebulaAchievementToast;
++class NebulaFpsCounter;
+ class NebulaModText;
+ class NoteCounter;
+ class OneUpBoard;
+@@ -57,6 +58,8 @@ public:
+     NebulaAchievementToast* mAchievementToast;
+     // Plugins' lines of text over the game (draw_text), drawn with the pop-up; null while no mod's code runs.
+     NebulaModText* mModText;
++    // The frames a second readout (DISPLAY > INTERFACE > FPS COUNTER), drawn last of all.
++    NebulaFpsCounter* mFpsCounter;
+     // Nebula's achievement board, in the Observatory (its Luma opens it); null elsewhere.
+     NebulaAchievementBoard* mAchievementBoard;
+ };
+diff --git a/native/petari/include/Game/Screen/NebulaFpsCounter.hpp b/native/petari/include/Game/Screen/NebulaFpsCounter.hpp
+new file mode 100644
+index 0000000..7b105d4
+--- /dev/null
++++ b/native/petari/include/Game/Screen/NebulaFpsCounter.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++#include "Game/Screen/LayoutActor.hpp"
++
++class NebulaPaneKit;
++
++namespace Ui {
++    class Pane;
++    class TextBox;
++    class Window;
++}  // namespace Ui
++
++// The frames a second readout (DISPLAY > INTERFACE > FPS COUNTER): the presents the display got this second, smoothed,
++// in the game's message font on the information window, painted in the blues of Nebula's menus. Top left, above every
++// other 2D element. GameScene runs and draws it with NebulaModText; GameSceneLayoutHolder makes it.
++class NebulaFpsCounter : public LayoutActor {
++public:
++    NebulaFpsCounter();
++
++    virtual void init(const TableIter& rIter) override;
++
++    // GameScene: the host's measure, the window around it, and their drawing.
++    void update();
++    void drawOnTop() const;
++
++private:
++    void place();
++    // "120 FPS" for `tenths` (the host's measure, in tenths of a frame a second).
++    void setValue(u32 tenths);
++
++    NebulaPaneKit* mKitText;    // InformationWindow: the game's message font
++    NebulaPaneKit* mKitWindow;  // SysInfoWindowMini: the window with a ring
++    Ui::Pane* mGroup;
++    Ui::Window* mPanel;
++    Ui::TextBox* mValue;
++    f32 mScaleX;
++    f32 mWidth;
++    f32 mHeight;
++    u32 mShownTenths;
++    bool mReady;
++};
+diff --git a/native/petari/include/Game/System/NebulaHost.hpp b/native/petari/include/Game/System/NebulaHost.hpp
+index 0e62e92..0c078e9 100644
+--- a/native/petari/include/Game/System/NebulaHost.hpp
++++ b/native/petari/include/Game/System/NebulaHost.hpp
+@@ -107,4 +107,11 @@ namespace NebulaHost {
+     inline int takePauseRequest() {
+         return nebula_host()->take_pause_request(nebula_host()->user);
+     }
++
++    // A sound of the settings menu, from the player's own files beside the game's data (data/menu-sounds, one WAV per
++    // NEBULA_UI_SOUND_* name): 1 when the host played it, 0 when the player has none, and the game makes its own.
++    inline int uiSound(u32 sound) {
++        const NebulaHostServices* const host = nebula_host();
++        return host->ui_sound != nullptr ? host->ui_sound(host->user, sound) : 0;
++    }
+ }  // namespace NebulaHost
+diff --git a/native/petari/src/Game/Scene/GameScene.cpp b/native/petari/src/Game/Scene/GameScene.cpp
+index dc12aaf..c296d4c 100644
+--- a/native/petari/src/Game/Scene/GameScene.cpp
++++ b/native/petari/src/Game/Scene/GameScene.cpp
+@@ -82,6 +82,7 @@
+ #include "Game/NPC/NebulaAchievementLuma.hpp"
+ #include "Game/Screen/NebulaAchievementBoard.hpp"
+ #include "Game/Screen/NebulaAchievementToast.hpp"
++#include "Game/Screen/NebulaFpsCounter.hpp"
+ #include "Game/Screen/NebulaModText.hpp"
+ #include "Game/System/NebulaAchievements.hpp"
+ #include "Game/Util/MessageUtil.hpp"
+@@ -296,6 +297,9 @@ void GameScene::update() {
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mAchievementToast != nullptr) {
+         MR::getGameSceneLayoutHolder()->mAchievementToast->update();
+     }
++    if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mFpsCounter != nullptr) {
++        MR::getGameSceneLayoutHolder()->mFpsCounter->update();
++    }
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mModText != nullptr) {
+         MR::getGameSceneLayoutHolder()->mModText->update();
+     }
+@@ -601,6 +605,10 @@ void GameScene::drawOverlay() const {
+     if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mAchievementToast != nullptr) {
+         MR::getGameSceneLayoutHolder()->mAchievementToast->drawOnTop();
+     }
++    // Last of all: the readout over everything 2D.
++    if (MR::isExistSceneObj(SceneObj_GameSceneLayoutHolder) && MR::getGameSceneLayoutHolder()->mFpsCounter != nullptr) {
++        MR::getGameSceneLayoutHolder()->mFpsCounter->drawOnTop();
++    }
+ }
+ 
+ bool GameScene::isValidScenarioOpeningCamera() const {
+diff --git a/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp b/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
+index 30039b3..c246b77 100644
+--- a/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
++++ b/native/petari/src/Game/Screen/GameSceneLayoutHolder.cpp
+@@ -10,6 +10,7 @@
+ #include "Game/NPC/NebulaAchievementLuma.hpp"
+ #include "Game/Screen/NebulaAchievementBoard.hpp"
+ #include "Game/Screen/NebulaAchievementToast.hpp"
++#include "Game/Screen/NebulaFpsCounter.hpp"
+ #include "Game/Screen/NebulaModText.hpp"
+ #include "Game/Screen/NoteCounter.hpp"
+ #include "Game/Screen/OneUpBoard.hpp"
+@@ -22,7 +23,7 @@
+ GameSceneLayoutHolder::GameSceneLayoutHolder()
+     : NameObj("ゲームシーンのレイアウト保持"), mCameraInfo(nullptr), mInformationMessage(nullptr), mMarioMeter(nullptr), mMarioSubMeter(nullptr),
+       mMissLayout(nullptr), mNoteCounter(nullptr), mYesNoLayout(nullptr), mPurpleCoinCounter(nullptr), mIsStatusInvalidatePending(false),
+-      mCounterLayoutCtrl(nullptr), mIsActiveDefaultGameLayout(true), mAchievementToast(nullptr), mModText(nullptr), mAchievementBoard(nullptr) {
++      mCounterLayoutCtrl(nullptr), mIsActiveDefaultGameLayout(true), mAchievementToast(nullptr), mModText(nullptr), mFpsCounter(nullptr), mAchievementBoard(nullptr) {
+     MR::joinToNameObjGroup(this, "IgnorePauseNameObj");
+     MR::connectToSceneLayoutMovement(this);
+ 
+@@ -61,6 +62,8 @@ GameSceneLayoutHolder::GameSceneLayoutHolder()
+         mModText = new NebulaModText();
+         mModText->initWithoutIter();
+     }
++    mFpsCounter = new NebulaFpsCounter();
++    mFpsCounter->initWithoutIter();
+     mAchievementBoard = nullptr;
+     if (NebulaAchievementLuma::isHere()) {
+         mAchievementBoard = new NebulaAchievementBoard();
+diff --git a/native/petari/src/Game/Screen/NebulaFpsCounter.cpp b/native/petari/src/Game/Screen/NebulaFpsCounter.cpp
+new file mode 100644
+index 0000000..9b4d357
+--- /dev/null
++++ b/native/petari/src/Game/Screen/NebulaFpsCounter.cpp
+@@ -0,0 +1,149 @@
++#include "Game/Screen/NebulaFpsCounter.hpp"
++#include <nebula_module.h>
++
++#include "Game/Screen/LayoutManager.hpp"
++#include "Game/Screen/NebulaPaneKit.hpp"
++#include "Game/Screen/NebulaUi.hpp"
++#include "Game/System/NebulaHost.hpp"
++#include <Game/Ui/Layout.hpp>
++#include <Game/Ui/Pane.hpp>
++#include <Game/Ui/TextBox.hpp>
++#include <Game/Ui/Window.hpp>
++#include <cstring>
++
++namespace {
++    // In the screen's units (the canvas is 456 high at every resolution): the number's size, the window's padding, its
++    // distance from the screen's top left corner, its corner radius, and the width the measure may take before the
++    // writer breaks the line (it never does: the readout is one short line).
++    const f32 cSize = 14.0f;
++    const f32 cPaddingX = 9.0f;
++    const f32 cPaddingY = 5.0f;
++    const f32 cMargin = 12.0f;
++    const f32 cRadius = 8.0f;
++    const f32 cMeasureLimit = 160.0f;
++
++    // The menus' blues: the deep navy window, its sky rim, and the readout in near white with a cool foot.
++    const u32 cPanelFill = 0x0B1F3ACA;
++    const u32 cPanelRing = 0x63B8F0FF;
++    const u32 cTextTop = 0xFFFFFFFF;
++    const u32 cTextBottom = 0xD8E9FAFF;
++}  // namespace
++
++NebulaFpsCounter::NebulaFpsCounter()
++    : LayoutActor("NebulaFpsCounter", true), mKitText(nullptr), mKitWindow(nullptr), mGroup(nullptr), mPanel(nullptr),
++      mValue(nullptr), mScaleX(1.0f), mWidth(0.0f), mHeight(0.0f), mShownTenths(0xFFFFFFFFu), mReady(false) {
++}
++
++void NebulaFpsCounter::init(const TableIter& /*rIter*/) {
++    initLayoutManager("InformationWindow", 0);
++    LayoutManager* pManager = getLayoutManager();
++    static const char cLayoutName[] = "NebulaFpsCounter";
++    delete[] pManager->mLayoutName;
++    pManager->mLayoutName = new char[sizeof(cLayoutName)];
++    memcpy(pManager->mLayoutName, cLayoutName, sizeof(cLayoutName));
++
++    Ui::Pane* pRoot = pManager->mLayout->mpRootPane;
++    mKitText = new NebulaPaneKit();
++    mKitWindow = new NebulaPaneKit();
++    if (pRoot == nullptr || !mKitText->init(pManager->mLayoutHolder, "InformationWindow", pManager->mLayout)) {
++        nebula_log("NebulaFpsCounter: no InformationWindow layout\n");
++        return;
++    }
++    // The window is the game's ringed one; without it the message font's own information window stands in.
++    const bool ringed = mKitWindow->init("SysInfoWindowMini", pManager->mLayout);
++    // The information window's own panes stay hidden: only the readout shows.
++    for (Ui::Pane* pChild : pRoot->GetChildList()) {
++        pChild->SetVisible(false);
++    }
++    mGroup = NebulaUi::makeGroup(pRoot, "NbFpsGroup");
++    if (mGroup == nullptr) {
++        return;
++    }
++    const NebulaUi::Kits kits = {mKitText, ringed ? mKitWindow : mKitText, nullptr};
++    mPanel = NebulaUi::makeWindow(kits, mGroup, "NbFpsPanel");
++    if (mPanel != nullptr) {
++        NebulaUi::paint(mPanel, cPanelFill, cPanelRing);
++    }
++    mValue = NebulaUi::makeText(kits, mGroup, "NbFpsValue", 16);
++    if (mValue == nullptr) {
++        return;
++    }
++    NebulaUi::setTextStyle(mValue, cSize, cTextTop, cTextBottom, 4);
++    NebulaUi::setText(mValue, u"0 FPS");
++    mGroup->SetVisible(false);
++    mReady = true;
++    LayoutActor::appear();
++}
++
++// "120 FPS" from the host's measure, in tenths of a frame a second, rounded to the frame.
++void NebulaFpsCounter::setValue(u32 tenths) {
++    char16_t digits[12];
++    u32 count = 0;
++    u32 value = (tenths + 5u) / 10u;
++    do {
++        digits[count++] = static_cast< char16_t >(u'0' + value % 10u);
++        value /= 10u;
++    } while (value != 0u && count < sizeof(digits) / sizeof(digits[0]));
++
++    char16_t text[20];
++    u32 length = 0;
++    while (count > 0 && length < 12) {
++        text[length++] = digits[--count];
++    }
++    static const char16_t cSuffix[] = u" FPS";
++    for (u32 i = 0; cSuffix[i] != 0 && length < 19; i++) {
++        text[length++] = cSuffix[i];
++    }
++    text[length] = 0;
++    NebulaUi::setText(mValue, text);
++}
++
++// The window and its number, in screen units: pinned to the screen's top left corner at any aspect ratio.
++void NebulaFpsCounter::place() {
++    mGroup->mScale = Vec2f(mScaleX, 1.0f);
++    NebulaUi::setTextStyle(mValue, cSize, cTextTop, cTextBottom, 4);
++    f32 textWidth = 0.0f;
++    f32 textHeight = 0.0f;
++    NebulaUi::measure(mValue, cMeasureLimit, &textWidth, &textHeight);
++    const f32 panelWidth = textWidth + 2.0f * cPaddingX;
++    const f32 panelHeight = textHeight + 2.0f * cPaddingY;
++    const f32 x = -mWidth * 0.5f + cMargin + panelWidth * 0.5f;
++    const f32 y = mHeight * 0.5f - cMargin - panelHeight * 0.5f;
++    if (mPanel != nullptr) {
++        NebulaUi::shape(mPanel, x, y, panelWidth, panelHeight, cRadius);
++    }
++    NebulaUi::setAnchor(mValue, 4);
++    mValue->mTranslate = Vec3f(x, NebulaUi::textCentre(y, cSize), 0.0f);
++}
++
++void NebulaFpsCounter::update() {
++    if (!mReady) {
++        return;
++    }
++    const u32 tenths = NebulaHost::option(NEBULA_OPTION_FPS);
++    // No measure yet (the renderer's first second): the window waits rather than showing a zero it would have to take
++    // back.
++    const bool shown = NebulaHost::option(NEBULA_OPTION_SHOW_FPS) != 0u && tenths != 0u;
++    mGroup->SetVisible(shown);
++    if (!shown) {
++        return;
++    }
++    f32 scaleX, width, height;
++    NebulaUi::readScreen(&scaleX, &width, &height);
++    if (scaleX != mScaleX || width != mWidth || height != mHeight || tenths != mShownTenths) {
++        mScaleX = scaleX;
++        mWidth = width;
++        mHeight = height;
++        mShownTenths = tenths;
++        setValue(tenths);
++        place();
++    }
++    movement();
++    calcAnim();
++}
++
++void NebulaFpsCounter::drawOnTop() const {
++    if (mReady) {
++        draw();
++    }
++}
+diff --git a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
+index 411e3a5..b51f5d5 100644
+--- a/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
++++ b/native/petari/src/Game/Screen/NebulaSettingsMenu.cpp
+@@ -35,6 +35,15 @@
+ using namespace NebulaUi;
+ 
+ namespace {
++    // A sound of the menu: the player's own from beside the game's data (data/menu-sounds, nebula_game_api.h
++    // NEBULA_UI_SOUND_*), else the game's own effect. The host's player is used because the game's own streams are
++    // faded out while the menu is open (AudSystem::holdForSettingsMenu).
++    void menuSound(u32 sound, const char* pFallback) {
++        if (NebulaHost::uiSound(sound) == 0) {
++            MR::startSystemSE(pFallback);
++        }
++    }
++
+     // Screen units (NebulaUi::readScreen): 456 high, 810 wide at 16:9.
+     NEBULA_TUNABLE(f32, cMargin, 16.0f);     // the window from the screen's edges
+     NEBULA_TUNABLE(f32, cMaxWidth, 900.0f);  // a wide screen keeps a window that reads as one
+@@ -108,29 +117,38 @@ namespace {
+     NEBULA_TUNABLE(f32, cEdgeScrollRows, 8.0f);  // a list under a dragged mod at its edge scrolls this many rows a second at most
+     NEBULA_TUNABLE(s32, cRowChipsFirst, 48);   // the rows' buttons made with the screen; more when the rows in sight need them
+ 
+-    // The quit question's window and text; the game's blue for what is chosen.
+-    const u32 cText = 0x4A5274FF;
+-    NEBULA_TUNABLE(u32, cSubText, 0x737B9AFF);
+-    NEBULA_TUNABLE(u32, cAccent, 0x2F6FD0FF);
+-    const u32 cDisabled = NEBULA_RGBA(0x9A, 0xA2, 0xBC, 0xFF);
+-    const u32 cWarning = NEBULA_RGBA(0xC8, 0x40, 0x2E, 0xFF);
+-    NEBULA_TUNABLE(u32, cHighlightFill, 0xFFFFFFFF);
+-    NEBULA_TUNABLE(u32, cFrameFill, 0xFFFFFFB4);   // a row's frame
+-    NEBULA_TUNABLE(u32, cFrameFixed, 0xFFFFFF5A);  // a row that only shows something
+-    const u32 cFrameRing = NEBULA_RGBA(0xC6, 0xD3, 0xEB, 0xFF);
+-    NEBULA_TUNABLE(u32, cHighlightRing, 0x7EC8F4FF);
+-    NEBULA_TUNABLE(u32, cRule, 0xB4C2DEFF);
+-    NEBULA_TUNABLE(u32, cTrack, 0x4A527428);
+-    const u32 cSliderTrack = NEBULA_RGBA(0xCB, 0xD6, 0xEB, 0xFF);
+-    NEBULA_TUNABLE(u32, cSliderFill, 0x6FA6EAFF);
+-    NEBULA_TUNABLE(u32, cRowButtonFill, 0xE4F6FFFF);  // a row's own button: its face, its ring, the edge under it
+-    NEBULA_TUNABLE(u32, cRowButtonRing, 0x5CC4F0FF);
+-    NEBULA_TUNABLE(u32, cRowButtonLit, 0xFFFFFFFF);  // focused
+-    NEBULA_TUNABLE(u32, cRowButtonLitRing, 0x2F9AEEFF);
+-    NEBULA_TUNABLE(u32, cRowButtonEdge, 0x3E86C8FF);
+-    NEBULA_TUNABLE(u32, cRowButtonOff, 0xEEF1F6FF);  // unavailable
+-    NEBULA_TUNABLE(u32, cThumb, 0x7EA8E8FF);
+-    NEBULA_TUNABLE(u32, cButtonText, 0x505050FF);
++    // The menu's look: a deep navy window with a bright sky rim and gold for what is chosen, after the blue menus of
++    // New Super Mario Bros. Wii. Every colour here is a tunable (docs/TUNABLES.md), so a mod can repaint it whole.
++    const u32 cText = 0xFFFFFFFF;                       // a row's label, near white with a cool foot
++    const u32 cTextLow = NEBULA_RGBA(0xD8, 0xE9, 0xFA, 0xFF);
++    NEBULA_TUNABLE(u32, cSubText, 0xA6C4E6FF);          // the status line, the hints, the em dashes
++    NEBULA_TUNABLE(u32, cAccent, 0x8FD9FFFF);           // a section's heading and its rule
++    NEBULA_TUNABLE(u32, cAccentLow, 0x5FA8E8FF);
++    const u32 cDisabled = NEBULA_RGBA(0x8C, 0xA6, 0xC4, 0xFF);
++    const u32 cWarning = NEBULA_RGBA(0xFF, 0xB0, 0x5A, 0xFF);
++    NEBULA_TUNABLE(u32, cHighlightFill, 0x2C7FD6F0);    // the chosen row
++    NEBULA_TUNABLE(u32, cHighlightRing, 0xFFD24DFF);    // its gold rim
++    NEBULA_TUNABLE(u32, cFrameFill, 0x17385FB4);        // a row's frame
++    NEBULA_TUNABLE(u32, cFrameFixed, 0x102A4A8C);       // a row that only shows something
++    const u32 cFrameRing = NEBULA_RGBA(0x2C, 0x5A, 0x8F, 0xFF);
++    NEBULA_TUNABLE(u32, cPanelFill, 0x0B1F3AEC);        // the window itself: deep navy, a little see-through
++    NEBULA_TUNABLE(u32, cPanelRing, 0x63B8F0FF);        // its rim: the sky over the mushroom kingdom
++    NEBULA_TUNABLE(u32, cShadowFill, 0x020A16A0);       // under it
++    NEBULA_TUNABLE(u32, cRule, 0x6FB6E8B4);
++    NEBULA_TUNABLE(u32, cTrack, 0xFFFFFF28);
++    const u32 cSliderTrack = NEBULA_RGBA(0x0D, 0x24, 0x40, 0xFF);
++    NEBULA_TUNABLE(u32, cSliderFill, 0x59C8FFFF);
++    NEBULA_TUNABLE(u32, cRowButtonFill, 0xEAF4FFFF);    // a row's own button: its face, its ring, the edge under it
++    NEBULA_TUNABLE(u32, cRowButtonRing, 0x63B8F0FF);
++    NEBULA_TUNABLE(u32, cRowButtonLit, 0xFFFFFFFF);     // focused
++    NEBULA_TUNABLE(u32, cRowButtonLitRing, 0xFFD24DFF);
++    NEBULA_TUNABLE(u32, cRowButtonEdge, 0x143A66FF);
++    NEBULA_TUNABLE(u32, cRowButtonOff, 0x9FB4C8FF);     // unavailable
++    NEBULA_TUNABLE(u32, cThumb, 0x8FD9FFFF);
++    NEBULA_TUNABLE(u32, cButtonText, 0x123055FF);       // on the game's white button art
++    NEBULA_TUNABLE(u32, cTabText, 0x1B5E9EFF);          // a page's button, its chosen one deeper still
++    NEBULA_TUNABLE(u32, cTabTextOn, 0x0B2A55FF);
++    NEBULA_TUNABLE(u32, cArrowText, 0x0E4C8AFF);        // a setting's arrows, on their white faces
+ 
+     enum { FooterApply, FooterBack, FooterNum };
+     enum { ChoiceNum = 3 };
+@@ -1367,13 +1385,15 @@ bool NebulaSettingsScreen::build() {
+     }
+     mShadow->mBasePosition = 4;
+     mPanel->mBasePosition = 4;
++    paint(mShadow, cShadowFill, cShadowFill);
++    paint(mPanel, cPanelFill, cPanelRing);
+     mPage->AppendChild(mShadow);
+     mPage->AppendChild(mPanel);
+     mTitle = makeText(mKits, mPage, "NsTitle", 64);
+     if (mTitle == nullptr) {
+         return false;
+     }
+-    setTextStyle(mTitle, cTitleSize, cText, cText, 3);
++    setTextStyle(mTitle, cTitleSize, cText, cTextLow, 3);
+     while (mTabsMade < cTabsFirst) {
+         if (!addTab()) {
+             return false;
+@@ -1459,6 +1479,8 @@ bool NebulaSettingsScreen::build() {
+     mQuestionDim->mBasePosition = 4;
+     mQuestionShadow->mBasePosition = 4;
+     mQuestionPanel->mBasePosition = 4;
++    paint(mQuestionShadow, cShadowFill, cShadowFill);
++    paint(mQuestionPanel, cPanelFill, cPanelRing);
+     mQuestion->AppendChild(mQuestionDim);
+     mQuestion->AppendChild(mQuestionShadow);
+     mQuestion->AppendChild(mQuestionPanel);
+@@ -1642,7 +1664,8 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
+             }
+         }
+         setText(rRow.mLabel, text.c_str());
+-        setTextStyle(rRow.mLabel, heading ? cHeadingSize : cTextSize, heading ? cAccent : cText, heading ? cAccent : cText, 3);
++        setTextStyle(rRow.mLabel, heading ? cHeadingSize : cTextSize, heading ? cAccent : cText,
++                     heading ? cAccentLow : cTextLow, 3);
+         measure(rRow.mLabel, 4000.0f, &rRow.mLabelWidth, &height);
+         rRow.mRule->SetVisible(heading);
+         rRow.mFrame->SetVisible(!heading);
+@@ -1804,7 +1827,7 @@ __attribute__((noinline)) void NebulaSettingsScreen::fillTexts(const NebulaSetti
+         mQuestionShown = question;
+         setQuestion(question);
+         if (question >= 0) {
+-            MR::startSystemSE("SE_SY_TALK_FOCUS_ITEM");
++            menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+         }
+     }
+     if (question < 0) {
+@@ -2278,7 +2301,7 @@ void NebulaSettingsScreen::readModsPointer(const NebulaSettingsView& rView, f32
+         if (!mDragging && moved) {
+             mDragging = true;
+             mEdgeScrollNs = 0u;
+-            MR::startSystemSE("SE_SY_TALK_FOCUS_ITEM");
++            menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+         }
+         mDropList = mDragging ? overList : -1;
+         if (mDropList >= 0) {
+@@ -2300,7 +2323,7 @@ void NebulaSettingsScreen::readModsPointer(const NebulaSettingsView& rView, f32
+                 if (mDropList != mItemList[index] || place != mItemPlace[index]) {
+                     NebulaHost::settingsInput(NEBULA_SETTINGS_SELECT_ROW, mDragRow);
+                     NebulaHost::settingsInput(NEBULA_SETTINGS_MOVE_MOD, (mDropList + 1) << 16 | place);
+-                    MR::startSystemSE("SE_SY_SELECT_PAUSE_ITEM");
++                    menuSound(NEBULA_UI_SOUND_SELECT, "SE_SY_SELECT_PAUSE_ITEM");
+                     const char* pLabel = rView.rows[index].label;
+                     u32 length = 0;
+                     while (pLabel[length] != '\0') {
+@@ -2711,7 +2734,8 @@ RowChip& NebulaSettingsScreen::useRowChip(s32 index, s32 row, s32 button, u32 ve
+         rPooled.mVersion = version;
+         rChip.mFocusLevel = 0.0f;
+         const bool arrow = button == ChipLess || button == ChipMore;
+-        setTextStyle(rChip.mText, arrow ? cArrowSize : cRowButtonSize, arrow ? cAccent : cButtonText, arrow ? cAccent : cButtonText, 4);
++        setTextStyle(rChip.mText, arrow ? cArrowSize : cRowButtonSize, arrow ? cArrowText : cButtonText,
++                      arrow ? cArrowText : cButtonText, 4);
+         setText(rChip.mText, pWord);
+         rChip.mText->mRotate.z = button == ChipLess ? 90.0f : button == ChipMore ? -90.0f : 0.0f;
+         f32 height = 0.0f;
+@@ -2935,7 +2959,7 @@ void NebulaSettingsScreen::place(const NebulaSettingsView& rView) {
+         const f32 word = mTabWordWidths[i];
+         rTab.mText->mScale = Vec2f(word > room && word > 0.0f ? room / word : 1.0f, 1.0f);
+         rTab.mText->mTranslate = Vec3f(0.0f, textCentre(0.0f, cTabSize), 0.0f);
+-        setTextColor(rTab.mText, active ? cAccent : cButtonText, active ? cAccent : cButtonText);
++        setTextColor(rTab.mText, active ? cTabTextOn : cTabText, active ? cTabTextOn : cTabText);
+     }
+ 
+     const bool asking = mQuestionShown >= 0;
+@@ -3042,7 +3066,7 @@ void NebulaSettingsScreen::placeJoyCon(f32 top) {
+     const bool paired = (bits & NEBULA_JOYCON_PAIRED) != 0;
+     const bool both = (bits & (NEBULA_JOYCON_LEFT | NEBULA_JOYCON_RIGHT)) == (NEBULA_JOYCON_LEFT | NEBULA_JOYCON_RIGHT);
+     if (paired && !mJoyConPaired) {
+-        MR::startSystemSE("SE_SY_TALK_OK");
++        menuSound(NEBULA_UI_SOUND_OK, "SE_SY_TALK_OK");
+     }
+     mJoyConPaired = paired;
+     const f32 phase = static_cast< f32 >(mFrame % 72) / 72.0f;
+@@ -3188,12 +3212,12 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+         }
+         mClosing = false;
+         if (!home) {
+-            MR::startSystemSE("SE_SY_PAUSE_ON");
++            menuSound(NEBULA_UI_SOUND_OPEN, "SE_SY_PAUSE_ON");
+         }
+     } else if (!wanted && isShown() && !mClosing) {
+         mClosing = true;
+         if (!mHome) {
+-            MR::startSystemSE("SE_SY_PAUSE_OFF");
++            menuSound(NEBULA_UI_SOUND_CLOSE, "SE_SY_PAUSE_OFF");
+         }
+     }
+     if (mClosing) {
+@@ -3239,7 +3263,7 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+     } else if (view.open && (view.open != mShown.open || view.revision != mShown.revision)) {
+         // What changed, as the game's menus sound it.
+         if (rView.page != mShown.page) {
+-            MR::startSystemSE("SE_SY_GALAMAP_PAGE_CHANGE");
++            menuSound(NEBULA_UI_SOUND_PAGE, "SE_SY_GALAMAP_PAGE_CHANGE");
+             mScrollTarget = 0.0f;
+             mFrame = 1;  // the new page's rows and highlight start in place
+             // What the pointer held belongs to the old page.
+@@ -3251,19 +3275,20 @@ void NebulaSettingsScreen::step(const NebulaSettingsView& rView, s32 homeView) {
+             mDragRow = -1;
+             mDragging = false;
+         } else if (rView.selected != mShown.selected) {
+-            // Moving through the rows is silent; a change or a press sounds.
++            // The highlight arriving at another row ticks, as the console's menus do; a value changed sounds instead.
+             if (static_cast< s32 >(rView.selected) != mPointerRow) {
+                 mPointerMode = false;  // the keys or a controller moved it: the pointer waits until it moves
++                menuSound(NEBULA_UI_SOUND_FOCUS, "SE_SY_TALK_FOCUS_ITEM");
+             }
+         } else {
+             const NebulaSettingsRow* pNow = rowAt(rView, rView.selected);
+             const NebulaSettingsRow* pBefore = rowAt(mShown, rView.selected);
+             if (pNow != nullptr && pBefore != nullptr && !MR::isEqualString(pNow->value, pBefore->value)) {
+-                MR::startSystemSE("SE_SY_SELECT_PAUSE_ITEM");
++                menuSound(NEBULA_UI_SOUND_SELECT, "SE_SY_SELECT_PAUSE_ITEM");
+             }
+         }
+         if (rView.status == NEBULA_SETTINGS_STATUS_APPLIED && mShown.status != NEBULA_SETTINGS_STATUS_APPLIED) {
+-            MR::startSystemSE("SE_SY_TALK_OK");
++            menuSound(NEBULA_UI_SOUND_OK, "SE_SY_TALK_OK");
+         }
+         fillTexts(view, &mShown);
+         if (!mBuilt) {
+diff --git a/platform/sdl/CMakeLists.txt b/platform/sdl/CMakeLists.txt
+index eab4aa0..1c98be0 100644
+--- a/platform/sdl/CMakeLists.txt
++++ b/platform/sdl/CMakeLists.txt
+@@ -151,6 +151,7 @@ add_library(galaxy_render_vk STATIC
+     ${rt}/tilt.cpp
+     ${rt}/audio_mixer.cpp
+     ${rt}/native_audio.cpp
++    ${rt}/ui_sounds.cpp
+     ${rt}/movie_audio.cpp
+     ${rt}/atomic_file.cpp
+     ${rt}/asset_store.cpp
+diff --git a/platform/sdl/host_window_sdl.cpp b/platform/sdl/host_window_sdl.cpp
+index 3db51a7..dbe5673 100644
+--- a/platform/sdl/host_window_sdl.cpp
++++ b/platform/sdl/host_window_sdl.cpp
+@@ -1849,7 +1849,7 @@ std::optional<input::DeviceKey> last_input_device() noexcept {
+     return std::nullopt;
+ }
+ 
+-void arm_controller_binding_capture(input::ControlScheme scheme, std::uint8_t slot) noexcept {
++void arm_controller_binding_capture(input::ControlScheme scheme, std::uint32_t slot) noexcept {
+     const std::lock_guard<std::mutex> lock(galaxy::sdl::g_input_mutex);
+     galaxy::sdl::g_capture_result.reset();
+     galaxy::sdl::g_capture_device = input::DeviceKey{scheme, slot};
+diff --git a/runtime/include/galaxy/native_audio.h b/runtime/include/galaxy/native_audio.h
+index d433ec0..92def1d 100644
+--- a/runtime/include/galaxy/native_audio.h
++++ b/runtime/include/galaxy/native_audio.h
+@@ -27,6 +27,9 @@ public:
+     void stop();
+     void mix(float gain, std::uint32_t used);
+     void frame();
++    // A sound of the settings menu (ui_sounds.h), from the player's own files: true when it plays, false when the file is
++    // not there and the game should make its own. Any thread.
++    bool ui_sound(std::uint32_t id);
+     // The movie player's sound (nebula_game_api.h movie_audio*).
+     int movie_audio(const void* record, std::uint32_t size);
+     double movie_audio_position();
+diff --git a/runtime/include/galaxy/platform_paths.h b/runtime/include/galaxy/platform_paths.h
+index 773324a..13e6c01 100644
+--- a/runtime/include/galaxy/platform_paths.h
++++ b/runtime/include/galaxy/platform_paths.h
+@@ -36,6 +36,10 @@ namespace galaxy {
+         return {};
+     }
+     return std::filesystem::path(app_data) / L"Nebula";
++#elif defined(NEBULA_XBOX360)
++    // The console's writable store. A game's own saves live on the hard disk; a USB stick's root is the fallback when
++    // the disk's content partition is not there (a console without a disk boots from USB).
++    return std::filesystem::path("Hdd:\\Nebula");
+ #else
+     if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg != nullptr && xdg[0] == '/') {
+         return std::filesystem::path(xdg) / "Nebula";
+@@ -60,7 +64,7 @@ namespace galaxy {
+ 
+ // This process's id (a diagnostics file's name: runs sharing a data folder keep their own).
+ [[nodiscard]] inline unsigned long current_process_id() noexcept {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(NEBULA_XBOX360)
+     return static_cast<unsigned long>(GetCurrentProcessId());
+ #else
+     return static_cast<unsigned long>(getpid());
+@@ -72,6 +76,13 @@ namespace galaxy {
+ #if defined(_WIN32)
+     const std::wstring exe = windows::executable_path();
+     return exe.empty() ? std::filesystem::path{} : std::filesystem::path(exe).parent_path();
++#elif defined(NEBULA_XBOX360)
++    // The .xex's own folder: on a console it is where the content was unpacked (D:\Nebula, Hdd:\Apps\Nebula, Usb0:\...).
++    char path[MAX_PATH]{};
++    if (GetModuleFileNameA(nullptr, path, static_cast<DWORD>(sizeof(path))) == 0) {
++        return {};
++    }
++    return std::filesystem::path(path).parent_path();
+ #else
+     std::error_code error;
+     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
+diff --git a/runtime/include/galaxy/platform_time.h b/runtime/include/galaxy/platform_time.h
+index 305bf93..9fb4ad5 100644
+--- a/runtime/include/galaxy/platform_time.h
++++ b/runtime/include/galaxy/platform_time.h
+@@ -2,23 +2,44 @@
+ #pragma once
+ 
+ // The runtime's high-resolution clock in ticks of qpc_frequency() per second: QueryPerformanceCounter on Windows,
+-// CLOCK_MONOTONIC nanoseconds elsewhere.
++// CLOCK_MONOTONIC nanoseconds elsewhere, Xenon's time base (a 50 MHz counter that both cores and the GPU keep) on
++// Xbox 360.
+ 
+ #include <cstdint>
+ 
+ #if defined(_WIN32)
+ #include "galaxy/windows_api.h"
++#elif defined(NEBULA_XBOX360)
++// Xenon's time base: mftbu/mftb. No header of its own.
+ #else
+ #include <time.h>
+ #endif
+ 
+ namespace galaxy {
+ 
++#if defined(NEBULA_XBOX360)
++// The console's 64-bit time base register. Read in the order the PowerPC requires: the upper word, the lower, and the
++// upper again to catch the carry, else a read landing across the wrap returns a value 4 billion ticks late.
++[[nodiscard]] inline std::uint64_t xbox360_time_base() noexcept {
++    std::uint32_t upper = 0u;
++    std::uint32_t lower = 0u;
++    std::uint32_t again = 0u;
++    do {
++        __asm__ volatile("mftbu %0" : "=r"(upper));
++        __asm__ volatile("mftb %0" : "=r"(lower));
++        __asm__ volatile("mftbu %0" : "=r"(again));
++    } while (upper != again);
++    return (static_cast<std::uint64_t>(upper) << 32u) | lower;
++}
++#endif
++
+ [[nodiscard]] inline std::int64_t qpc_now() noexcept {
+ #if defined(_WIN32)
+     LARGE_INTEGER now{};
+     QueryPerformanceCounter(&now);
+     return now.QuadPart;
++#elif defined(NEBULA_XBOX360)
++    return static_cast<std::int64_t>(xbox360_time_base());
+ #else
+     timespec now{};
+     clock_gettime(CLOCK_MONOTONIC, &now);
+@@ -34,6 +55,8 @@ namespace galaxy {
+         return static_cast<std::int64_t>(value.QuadPart);
+     }();
+     return frequency;
++#elif defined(NEBULA_XBOX360)
++    return 50000000;  // Xenon's time base ticks at 50 MHz, on every core
+ #else
+     return 1000000000;
+ #endif
+diff --git a/runtime/include/galaxy/render/render_config.h b/runtime/include/galaxy/render/render_config.h
+index f1386b9..e028180 100644
+--- a/runtime/include/galaxy/render/render_config.h
++++ b/runtime/include/galaxy/render/render_config.h
+@@ -77,6 +77,10 @@ struct RenderConfig {
+     // scale, then to the window) instead of one.
+     bool     hud_output_resolution = false;
+ 
++    // The frames-per-second readout over the game (DISPLAY > INTERFACE > FPS COUNTER), drawn by the game module in
++    // the game's own message font: the presents the display got this second, smoothed.
++    bool     show_fps            = false;
++
+     // Presentation image quality (post_process.h), applied to the presented frame on the render thread; false
+     // presents with the plain bilinear blit.
+     bool     post_process        = true;
+diff --git a/runtime/include/galaxy/ui_sounds.h b/runtime/include/galaxy/ui_sounds.h
+new file mode 100644
+index 0000000..196ba1f
+--- /dev/null
++++ b/runtime/include/galaxy/ui_sounds.h
+@@ -0,0 +1,55 @@
++// The settings menu's own sounds (nebula_game_api.h ui_sound): short 16-bit WAV files the player keeps beside the
++// game's other data, played by the host's mixer rather than by the game.
++//
++// The game's own effects cannot carry the menu: while it is open the game fades its music and its streams to silence
++// (AudSystem::holdForSettingsMenu), and a sound the player drops in as a mod is a stream. These are mixed straight into
++// the output frame, at the effects volume, so the effects slider and the master both reach them.
++//
++// The files are `<data>/menu-sounds/<role>.wav`, one per role below; a role whose file is missing (or is not 16-bit
++// PCM) stays silent and the game falls back to its own effect.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++
++namespace galaxy::host {
++
++// The menu's sounds. The host and the game share these numbers (nebula_game_api.h NEBULA_UI_SOUND_*).
++enum UiSoundId : std::uint32_t {
++    kUiSoundFocus = 0,   // the highlight arrives at something
++    kUiSoundSelect = 1,  // a value changes, a mod is dropped
++    kUiSoundPage = 2,    // another page
++    kUiSoundOpen = 3,    // the menu opens
++    kUiSoundClose = 4,   // the menu closes
++    kUiSoundOk = 5,      // a change is applied
++    kUiSoundCount = 6,
++};
++
++class UiSounds {
++public:
++    UiSounds();
++    ~UiSounds();
++    UiSounds(const UiSounds&) = delete;
++    UiSounds& operator=(const UiSounds&) = delete;
++
++    // Reads the WAVs of `<data>/menu-sounds` (runtime_settings_folder), or of `folder` when it is given. Roles whose
++    // file is missing stay silent. Safe to call before any device opens; calling it again replaces what was loaded.
++    void load(const char* folder = nullptr);
++    // The roles this load found, for the log ("focus select page"), empty when it found none.
++    [[nodiscard]] const char* loaded() const;
++
++    // Queues `id` for the next frame. Any thread; safe before the device pulls. True when the file is there (it will be
++    // heard), false when it is not.
++    bool play(std::uint32_t id);
++
++    // Adds every voice queued or still sounding into `out` (interleaved stereo, `frames` long), at a gain ramped from
++    // `gain_start` to `gain_end` across the frame. The device's thread.
++    void mix(float* out, std::size_t frames, std::uint32_t rate, float gain_start, float gain_end);
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++}  // namespace galaxy::host
+diff --git a/runtime/src/asset_store.cpp b/runtime/src/asset_store.cpp
+index 603cf48..7621bcd 100644
+--- a/runtime/src/asset_store.cpp
++++ b/runtime/src/asset_store.cpp
+@@ -19,10 +19,88 @@ namespace {
+ 
+ constexpr std::size_t kHeader = 64;
+ 
++// The store is little-endian whatever reads it (cook/store.rs). On a big-endian machine (the Xbox 360's Xenon) the words
++// are byte-reversed on the way out of the index; the tables themselves are converted once, in place
++// (host_index_order), because their fields are only ever read.
++constexpr bool kHostIsBigEndian = [] {
++    const std::uint32_t probe = 1u;
++    unsigned char first = 0u;
++    std::memcpy(&first, &probe, 1u);
++    return first == 0u;
++}();
++
++std::uint32_t tail32(std::uint32_t value) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        return value;
++    }
++    return (value >> 24u) | ((value >> 8u) & 0x0000ff00u) | ((value << 8u) & 0x00ff0000u) | (value << 24u);
++}
++
++std::uint64_t tail64(std::uint64_t value) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        return value;
++    }
++    return (static_cast<std::uint64_t>(tail32(static_cast<std::uint32_t>(value))) << 32u) |
++           tail32(static_cast<std::uint32_t>(value >> 32u));
++}
++
++std::uint32_t word32(const std::uint8_t* at) {
++    std::uint32_t value;
++    std::memcpy(&value, at, sizeof(value));
++    return tail32(value);
++}
++
+ std::uint64_t word(const std::uint8_t* at) {
+     std::uint64_t value;
+     std::memcpy(&value, at, sizeof(value));
+-    return value;
++    return tail64(value);
++}
++
++void host_u32(std::uint8_t* at) {
++    std::uint32_t value;
++    std::memcpy(&value, at, sizeof(value));
++    value = tail32(value);
++    std::memcpy(at, &value, sizeof(value));
++}
++
++void host_u64(std::uint8_t* at) {
++    std::uint64_t value;
++    std::memcpy(&value, at, sizeof(value));
++    value = tail64(value);
++    std::memcpy(at, &value, sizeof(value));
++}
++
++// A store's index (the node table, the hash table, the names) brought to the machine's own order: the header's words are
++// read through word()/word32(), and this is the tables' one conversion. Little-endian machines return untouched; a
++// big-endian machine swaps each node's 8- and 4-byte fields and each hash's, leaving the names' bytes alone.
++void host_index_order(std::uint8_t* table, std::uint64_t size, std::uint64_t nodes_at, std::uint64_t hashes_at,
++                      std::uint32_t count) noexcept {
++    if constexpr (!kHostIsBigEndian) {
++        (void)table;
++        (void)size;
++        (void)nodes_at;
++        (void)hashes_at;
++        (void)count;
++        return;
++    }
++    for (std::uint32_t i = 0u; i < count; ++i) {
++        std::uint8_t* const node = table + nodes_at + static_cast<std::uint64_t>(i) * 40u;
++        if (nodes_at + static_cast<std::uint64_t>(i + 1u) * 40u > size) {
++            return;
++        }
++        host_u64(node + 0u);
++        host_u64(node + 8u);
++        for (std::uint32_t field = 16u; field < 40u; field += 4u) {
++            host_u32(node + field);
++        }
++        std::uint8_t* const hash = table + hashes_at + static_cast<std::uint64_t>(i) * 16u;
++        if (hashes_at + static_cast<std::uint64_t>(i + 1u) * 16u > size) {
++            return;
++        }
++        host_u64(hash + 0u);
++        host_u32(hash + 8u);
++        host_u32(hash + 12u);
++    }
+ }
+ 
+ bool is_archive_name(std::string_view part) {
+@@ -111,9 +189,7 @@ void AssetStore::close() {
+ }
+ 
+ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, std::uint64_t index_at, std::uint64_t size) {
+-    std::uint32_t version, count;
+-    std::memcpy(&version, header + 8, 4);
+-    std::memcpy(&count, header + 12, 4);
++    const std::uint32_t version = word32(header + 8), count = word32(header + 12);
+     const std::uint64_t nodes = word(header + 16), hashes = word(header + 24), names = word(header + 32),
+                         names_size = word(header + 40);
+     if (version != kStoreVersion || count == 0u || nodes < index_at || nodes > size || (size - nodes) / sizeof(Node) < count ||
+@@ -121,8 +197,18 @@ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, st
+         size - names < names_size || names_size == 0u || index[names - index_at + names_size - 1u] != 0u) {
+         return false;
+     }
+-    const auto* const node_table = reinterpret_cast<const Node*>(index + (nodes - index_at));
+-    const auto* const hash_table = reinterpret_cast<const Hash*>(index + (hashes - index_at));
++    // A big-endian machine reads the tables in its own order, from the copy the store already keeps; the little-endian
++    // ones point straight into the mapping and convert nothing.
++    const std::uint8_t* table = index;
++    if constexpr (kHostIsBigEndian) {
++        if (table != index_.data()) {
++            index_.assign(index, index + (size - index_at));
++        }
++        host_index_order(index_.data(), size - index_at, nodes - index_at, hashes - index_at, count);
++        table = index_.data();
++    }
++    const auto* const node_table = reinterpret_cast<const Node*>(table + (nodes - index_at));
++    const auto* const hash_table = reinterpret_cast<const Hash*>(table + (hashes - index_at));
+     // Every index the table holds is inside it, so a damaged file is refused here and nothing below checks again (read checks each
+     // read against the store's size).
+     for (std::uint32_t i = 0u; i < count; ++i) {
+@@ -135,7 +221,7 @@ bool AssetStore::parse(const std::uint8_t* header, const std::uint8_t* index, st
+     }
+     nodes_ = node_table;
+     hashes_ = hash_table;
+-    names_ = reinterpret_cast<const char*>(index + (names - index_at));
++    names_ = reinterpret_cast<const char*>(table + (names - index_at));
+     count_ = count;
+     game_id_.assign(reinterpret_cast<const char*>(header + 48), strnlen(reinterpret_cast<const char*>(header + 48), 6));
+     revision_ = header[55];
+diff --git a/runtime/src/native_audio.cpp b/runtime/src/native_audio.cpp
+index ecce990..bce07a4 100644
+--- a/runtime/src/native_audio.cpp
++++ b/runtime/src/native_audio.cpp
+@@ -9,6 +9,7 @@
+ #include "galaxy/path_text.h"
+ #include "galaxy/platform_time.h"
+ #include "galaxy/runtime_settings.h"
++#include "galaxy/ui_sounds.h"
+ #include "galaxy/wiimote_speaker.h"
+ 
+ #include <algorithm>
+@@ -329,6 +330,8 @@ std::unique_ptr<AudioDevice> open_null_audio_device(std::uint32_t rate) {
+ struct NativeGameAudio::State {
+     std::unique_ptr<AudioDevice> device;
+     std::unique_ptr<galaxy::audio::AudioMixer> mixer;
++    // The settings menu's sounds (ui_sounds.h), from the player's own files.
++    UiSounds ui;
+     AudioWavDump wav;
+     float master{1.0f};
+     bool master_started{};
+@@ -337,6 +340,9 @@ struct NativeGameAudio::State {
+     std::vector<float> speaker_frame;  // the remote speaker's frame on its own, while `audible` ramps
+     galaxy::SoundOutput sound_output{galaxy::SoundOutput::Stereo};
+     std::vector<std::byte> wav_block;
++    // What the WAV dump holds so far, so a take can be read back with each menu sound placed in it.
++    std::uint64_t dump_frames{};
++    std::uint32_t dump_rate{};
+     // The frames made and not yet pulled, interleaved; the device's thread only. Center, surround left and right apart
+     // from them while the device has rear speakers.
+     std::vector<float> pending;
+@@ -439,6 +445,11 @@ void NativeGameAudio::setup(NebulaVoice* voices, std::uint32_t count, const Nebu
+     s.mixer->setup(voices, count, effects);
+     const galaxy::RuntimeAudioSettings audio = galaxy::get_runtime_settings().audio;
+     s.mixer->set_category_gains({1.0f, audio.music, audio.voice, audio.sfx, audio.ambience, audio.cutscene});
++    // The settings menu's sounds: the player's own, from beside the game's data (ui_sounds.h).
++    s.ui.load();
++    if (const char* const found = s.ui.loaded(); found[0] != '\0') {
++        std::cerr << "[audio] menu sounds: " << found << '\n';
++    }
+ }
+ 
+ void NativeGameAudio::start(std::function<void()> tick) {
+@@ -461,6 +472,17 @@ void NativeGameAudio::mix(float gain, std::uint32_t used) {
+     }
+ }
+ 
++bool NativeGameAudio::ui_sound(std::uint32_t id) {
++    State& s = *state_;
++    const bool queued = s.ui.play(id);
++    // The dump is a test's take: name the moment of the sound in it, so the file can be read back at that sample.
++    if (s.dump_frames != 0u && s.dump_rate != 0u) {
++        std::fprintf(stderr, "[read] menu sound %u at dump %.3f s\n", id,
++                     static_cast<double>(s.dump_frames) / static_cast<double>(s.dump_rate));
++    }
++    return queued;
++}
++
+ // The frame: the master volume (ramped across the frame from the last one's), the remote speaker, the output's samples.
+ void NativeGameAudio::frame() {
+     if (state_->mixer == nullptr) {
+@@ -522,6 +544,9 @@ void NativeGameAudio::frame() {
+             out[i * 2u + 1u] += s.speaker_frame[i * 2u + 1u] * gain;
+         }
+     }
++    // The menu's sounds last, at the effects volume and through the same master ramp as the game's own, so the volume
++    // sliders and the background mute reach them like everything else. Mixed before the mono fold, so that reaches them too.
++    s.ui.mix(out.data(), frames, s.mixer->rate(), start * audio.sfx, target * audio.sfx);
+     if (audio.sound_output == galaxy::SoundOutput::Mono) {
+         for (std::size_t i = 0; i < frames; ++i) {
+             const float both = 0.5f * (out[i * 2u] + out[i * 2u + 1u]);
+@@ -545,6 +570,8 @@ void NativeGameAudio::frame() {
+             s.wav_block[i * 2u + 1u] = static_cast<std::byte>(bits >> 8u);
+         }
+         (void)s.wav.append(s.wav_block, s.mixer->rate());
++        s.dump_frames += frames;
++        s.dump_rate = s.mixer->rate();
+     }
+     for (float& value : out) {
+         value = std::clamp(value, -1.0f, 1.0f);
+diff --git a/runtime/src/render/core/draw_walker.cpp b/runtime/src/render/core/draw_walker.cpp
+index 82ad286..944865a 100644
+--- a/runtime/src/render/core/draw_walker.cpp
++++ b/runtime/src/render/core/draw_walker.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "galaxy/cpu_count.h"
+ #include "galaxy/frame_timeline.h"
++#include "galaxy/launch_args.h"
+ #include "galaxy/loss_report.h"
+ #include "galaxy/render/render_config.h"
+ #include "galaxy/run_options.h"
+diff --git a/runtime/src/render/frame_pass.cpp b/runtime/src/render/frame_pass.cpp
+index b9d9831..5cfe68f 100644
+--- a/runtime/src/render/frame_pass.cpp
++++ b/runtime/src/render/frame_pass.cpp
+@@ -2,7 +2,9 @@
+ // helpers.
+ 
+ #include "galaxy/render/frame_pass.h"
++#if !defined(NEBULA_GPU_VULKAN)
+ #include "barriers_d3d12.h"
++#endif
+ #include "galaxy/render/render_config.h"
+ #include "galaxy/render/renderer_common.h"
+ #if !defined(NEBULA_GPU_VULKAN)
+diff --git a/runtime/src/render/render_config.cpp b/runtime/src/render/render_config.cpp
+index 7e8bf4d..6d0d2fd 100644
+--- a/runtime/src/render/render_config.cpp
++++ b/runtime/src/render/render_config.cpp
+@@ -155,6 +155,7 @@ static void apply_kv(RenderConfig& cfg, const char* key, const char* val) {
+     else if (std::strcmp(key, "post_process") == 0) cfg.post_process = parse_bool(val, cfg.post_process);
+     else if (std::strcmp(key, "internal_height") == 0) cfg.internal_height = normalized_internal_height(parse_uint(val, cfg.internal_height));
+     else if (std::strcmp(key, "hud_output_resolution") == 0) cfg.hud_output_resolution = parse_bool(val, cfg.hud_output_resolution);
++    else if (std::strcmp(key, "show_fps") == 0) cfg.show_fps = parse_bool(val, cfg.show_fps);
+     else if (std::strcmp(key, "hdr") == 0) cfg.hdr = parse_bool(val, cfg.hdr);
+     else if (std::strcmp(key, "paper_white") == 0) cfg.paper_white = std::clamp(parse_uint(val, cfg.paper_white), 80u, 500u);
+     else if (std::strcmp(key, "aa") == 0) {
+@@ -578,6 +579,7 @@ bool save_render_config_to_file() {
+              << "paper_white=" << cfg.paper_white << '\n'
+              << "hud_output_resolution="
+              << (cfg.hud_output_resolution ? 1u : 0u) << '\n'
++             << "show_fps=" << (cfg.show_fps ? 1u : 0u) << '\n'
+              << "ray_tracing_enabled="
+              << (cfg.ray_tracing_enabled ? 1u : 0u) << '\n'
+              << "texture_packs=" << (cfg.texture_packs ? 1u : 0u) << '\n'
+diff --git a/runtime/src/ui/native_settings.cpp b/runtime/src/ui/native_settings.cpp
+index c1581ba..eb54086 100644
+--- a/runtime/src/ui/native_settings.cpp
++++ b/runtime/src/ui/native_settings.cpp
+@@ -560,6 +560,7 @@ unsigned pending_settings_changes() {
+     changes += d.ambient_occlusion_ssao != live.ambient_occlusion_ssao;
+     changes += d.bloom != live.bloom;
+     changes += d.hud_output_resolution != live.hud_output_resolution;
++    changes += d.show_fps != live.show_fps;
+     changes += d.ray_tracing_enabled != live.ray_tracing_enabled;
+     changes += d.rt_quality != live.rt_quality;
+     changes += d.rt_reflections != live.rt_reflections;
+@@ -985,6 +986,7 @@ void apply_native_settings_draft() {
+     applied.ambient_occlusion_ssao = next.ambient_occlusion_ssao;
+     applied.bloom = next.bloom;
+     applied.hud_output_resolution = next.hud_output_resolution;
++    applied.show_fps = next.show_fps;
+     applied.ray_tracing_enabled = next.ray_tracing_enabled;
+     applied.rt_quality = next.rt_quality;
+     applied.rt_reflections = next.rt_reflections;
+@@ -1597,6 +1599,12 @@ void request_native_settings_close() {
+     set_native_settings_visible(false);
+ }
+ 
++// The key that opens and closes the settings overlay: F10, and F1 as it always was. Every other place in the menu that
++// took F1 (a question's back answer, the on-screen controls' cancel) takes either, so the two keys behave alike.
++constexpr bool is_settings_key(std::uintptr_t key) noexcept {
++    return key == VK_F1 || key == VK_F10;
++}
++
+ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad = false) {
+     if (s_home_menu.visible.load(std::memory_order_acquire)) {
+         return handle_home_menu_key(key, was_down);
+@@ -1605,7 +1613,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+     // F1 and Escape close it; every other key waits.
+     if (s_native_settings_visible.load(std::memory_order_relaxed) &&
+         !s_settings_drawn_by_game.load(std::memory_order_acquire)) {
+-        if (!was_down && (key == VK_F1 || key == VK_ESCAPE)) {
++        if (!was_down && (is_settings_key(key) || key == VK_ESCAPE)) {
+             set_native_settings_visible(false);
+         }
+         return true;
+@@ -1634,7 +1642,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+             } else if (key == VK_BACK) {
+                 galaxy::host::reset_arranged_touch_controls();
+                 std::cerr << "[settings] ON-SCREEN CONTROLS: RESET\n";
+-            } else if (key == VK_ESCAPE || key == VK_F1) {
++            } else if (key == VK_ESCAPE || is_settings_key(key)) {
+                 galaxy::host::finish_arranging_touch_controls(false);
+                 std::cerr << "[settings] ON-SCREEN CONTROLS: CANCEL\n";
+             }
+@@ -1644,7 +1652,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+     if (s_joycon_pairing && s_native_settings_visible.load(std::memory_order_relaxed)) {
+         // The Pair Joy-Con screen: its one answer (Back) is Escape, B, A, Enter, Space, Backspace or F1; the rest
+         // waits (a paired Joy-Con's L and R must not turn the pages meanwhile).
+-        if (!was_down && (accept || key == VK_ESCAPE || key == VK_F1 || key == VK_RETURN || key == VK_SPACE ||
++        if (!was_down && (accept || key == VK_ESCAPE || is_settings_key(key) || key == VK_RETURN || key == VK_SPACE ||
+                           key == VK_BACK)) {
+             close_joycon_pairing();
+         }
+@@ -1670,16 +1678,16 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+             s_settings_leave_asking = false;
+             revert_native_settings_draft();
+             set_native_settings_visible(false);
+-        } else if (key == VK_ESCAPE || key == VK_F1) {
++        } else if (key == VK_ESCAPE || is_settings_key(key)) {
+             s_settings_leave_asking = false;
+         }
+         return true;
+     }
+-    if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
++    if (!is_settings_key(key) && s_native_settings_visible.load(std::memory_order_relaxed) &&
+         (dlss_prompt_key(key, was_down) || restart_ask_key(key, was_down))) {
+         return true;
+     }
+-    if (key != VK_F1 && s_native_settings_visible.load(std::memory_order_relaxed) &&
++    if (!is_settings_key(key) && s_native_settings_visible.load(std::memory_order_relaxed) &&
+         handle_controls_key(key, was_down, from_pad)) {
+         return true;
+     }
+@@ -1688,7 +1696,7 @@ bool handle_native_settings_key(std::uintptr_t key, bool was_down, bool from_pad
+         set_native_settings_visible(true);
+         return true;
+     }
+-    if (key == VK_F1) {
++    if (is_settings_key(key)) {
+         if (was_down) {
+             return true;
+         }
+@@ -3024,7 +3032,7 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
+     if (s_mods_code_ask.load(std::memory_order_acquire)) {
+         if (key == VK_RETURN || key == VK_SPACE) {
+             answer_mod_code(true);
+-        } else if (key == VK_ESCAPE || key == VK_BACK || key == VK_F1) {
++        } else if (key == VK_ESCAPE || key == VK_BACK || is_settings_key(key)) {
+             answer_mod_code(false);
+         }
+         return true;
+@@ -3038,7 +3046,7 @@ bool restart_ask_key(std::uintptr_t key, bool was_down) {
+         } else {
+             show_controls_message("COULD NOT RESTART");
+         }
+-    } else if (key == VK_ESCAPE || key == VK_BACK || key == VK_F1) {
++    } else if (key == VK_ESCAPE || key == VK_BACK || is_settings_key(key)) {
+         s_mods_restart_ask.store(false, std::memory_order_release);
+         s_rt_restart_ask.store(false, std::memory_order_release);
+         s_diagnostics_ask.store(false, std::memory_order_release);
+@@ -3248,7 +3256,7 @@ void native_settings_test_frame(std::uint32_t frame) {
+         if (text == nullptr || text[0] == '\0') return keys;
+         static constexpr std::pair<std::string_view, std::uintptr_t> kNames[] = {
+             {"up", VK_UP}, {"down", VK_DOWN}, {"left", VK_LEFT}, {"right", VK_RIGHT}, {"enter", VK_RETURN},
+-            {"esc", VK_ESCAPE}, {"tab", VK_TAB}, {"backspace", VK_BACK}, {"space", VK_SPACE}, {"f1", VK_F1}};
++            {"esc", VK_ESCAPE}, {"tab", VK_TAB}, {"backspace", VK_BACK}, {"space", VK_SPACE}, {"f1", VK_F1}, {"f10", VK_F10}};
+         std::string_view rest(text);
+         while (!rest.empty()) {
+             const std::size_t comma = rest.find(',');
+diff --git a/runtime/src/ui/settings_display_page.cpp b/runtime/src/ui/settings_display_page.cpp
+index caf02a7..86be189 100644
+--- a/runtime/src/ui/settings_display_page.cpp
++++ b/runtime/src/ui/settings_display_page.cpp
+@@ -121,6 +121,9 @@ std::vector<SettingsRow> display_page(const RenderConfig& render, const DisplayP
+                     fixed ? std::function<void(RenderConfig&, int)>{}
+                           : std::function<void(RenderConfig&, int)>{[](RenderConfig& draft, int) { draft.hud_output_resolution = !draft.hud_output_resolution; }},
+                     "DISPLAY DRAWS MENUS AND TEXT SHARP AT THE SCREEN RESOLUTION"});
++    rows.push_back({"FPS COUNTER", render.show_fps ? "ON" : "OFF",
++                    [](RenderConfig& draft, int) { draft.show_fps = !draft.show_fps; },
++                    "FRAMES PER SECOND IN THE GAME'S OWN FONT, TOP LEFT"});
+     return rows;
+ }
+ 
+diff --git a/runtime/src/ui_sounds.cpp b/runtime/src/ui_sounds.cpp
+new file mode 100644
+index 0000000..923419f
+--- /dev/null
++++ b/runtime/src/ui_sounds.cpp
+@@ -0,0 +1,262 @@
++// The settings menu's sounds: `data/menu-sounds/<role>.wav` loaded once, mixed into the output frame (ui_sounds.h).
++//
++// A clip is held as interleaved stereo floats at its own rate, played by linear interpolation from the game's thread to
++// the device's. The sounds are a few hundred milliseconds long, so the interpolation's error stays under a millisecond
++// of delay at any device rate, and there is no filter to ring on a blip.
++#include "galaxy/ui_sounds.h"
++
++#include "galaxy/runtime_settings.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace galaxy::host {
++namespace {
++
++// One per role, in UiSoundId's order. The loader looks for `<role>.wav`.
++constexpr const char* kRoleNames[] = {"focus", "select", "page", "open", "close", "ok"};
++static_assert(std::size(kRoleNames) == kUiSoundCount, "one file name per role");
++
++// Queued and sounding at once. Radial menu blips never come close; a stuck queue is capped rather than growing.
++constexpr std::size_t kVoices = 8;
++
++constexpr float kSfxGain = 1.0f;  // the effects bus is already `audio.sfx`; the clip plays at its own level
++
++struct Clip {
++    std::vector<float> samples;  // interleaved stereo
++    std::uint32_t rate = 0;
++    std::uint32_t frames = 0;
++
++    [[nodiscard]] bool ok() const { return rate != 0 && frames != 0; }
++};
++
++std::uint32_t read_le32(const unsigned char* p) {
++    return static_cast<std::uint32_t>(p[0]) | static_cast<std::uint32_t>(p[1]) << 8 |
++           static_cast<std::uint32_t>(p[2]) << 16 | static_cast<std::uint32_t>(p[3]) << 24;
++}
++
++std::uint16_t read_le16(const unsigned char* p) {
++    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(p[0]) | static_cast<std::uint16_t>(p[1]) << 8);
++}
++
++// A RIFF/WAVE file's `data` chunk as interleaved stereo floats. False with `why` set for anything but 8- or 16-bit PCM
++// (the menu's files are 16-bit; anything else is left out rather than resampled wrong).
++bool read_wav(const std::filesystem::path& path, Clip* pClip, std::string* pWhy) {
++    std::ifstream file(path, std::ios::binary);
++    if (!file) {
++        *pWhy = "cannot be opened";
++        return false;
++    }
++    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
++    if (bytes.size() < 12u || std::memcmp(bytes.data(), "RIFF", 4) != 0 || std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
++        *pWhy = "is not a RIFF/WAVE file";
++        return false;
++    }
++    unsigned format = 0;
++    unsigned channels = 0;
++    unsigned bits = 0;
++    std::uint32_t rate = 0;
++    const unsigned char* pData = nullptr;
++    std::size_t dataBytes = 0;
++    std::size_t at = 12u;
++    while (at + 8u <= bytes.size()) {
++        const unsigned char* const pChunk = bytes.data() + at;
++        const std::uint32_t size = read_le32(pChunk + 4);
++        const std::size_t body = at + 8u;
++        if (body > bytes.size()) {
++            break;
++        }
++        const std::size_t available = std::min<std::size_t>(size, bytes.size() - body);
++        if (std::memcmp(pChunk, "fmt ", 4) == 0 && available >= 16u) {
++            format = read_le16(bytes.data() + body);
++            channels = read_le16(bytes.data() + body + 2);
++            rate = read_le32(bytes.data() + body + 4);
++            bits = read_le16(bytes.data() + body + 14);
++            // WAVE_FORMAT_EXTENSIBLE: the real format is the first two bytes of the sub-format's GUID.
++            if (format == 0xFFFEu && available >= 26u) {
++                format = read_le16(bytes.data() + body + 24);
++            }
++        } else if (std::memcmp(pChunk, "data", 4) == 0) {
++            pData = bytes.data() + body;
++            dataBytes = available;
++        }
++        at = body + available + (available & 1u);  // chunks sit on even boundaries
++    }
++    if (format != 1u) {
++        *pWhy = "is not PCM";
++        return false;
++    }
++    if (channels != 1u && channels != 2u) {
++        *pWhy = "has more than two channels";
++        return false;
++    }
++    if (bits != 8u && bits != 16u) {
++        *pWhy = "is not 8- or 16-bit";
++        return false;
++    }
++    if (pData == nullptr || rate == 0u) {
++        *pWhy = "has no samples";
++        return false;
++    }
++    const std::size_t bytesPerSample = bits / 8u;
++    const std::uint32_t frames = static_cast<std::uint32_t>(dataBytes / (bytesPerSample * channels));
++    if (frames == 0u) {
++        *pWhy = "has no samples";
++        return false;
++    }
++    pClip->rate = rate;
++    pClip->frames = frames;
++    pClip->samples.assign(static_cast<std::size_t>(frames) * 2u, 0.0f);
++    for (std::uint32_t i = 0; i < frames; ++i) {
++        for (unsigned channel = 0; channel < 2u; ++channel) {
++            const unsigned from = channels == 2u ? channel : 0u;
++            const unsigned char* const pSample = pData + (static_cast<std::size_t>(i) * channels + from) * bytesPerSample;
++            const float value = bits == 16u
++                ? static_cast<float>(static_cast<std::int16_t>(read_le16(pSample))) / 32768.0f
++                : (static_cast<float>(pSample[0]) - 128.0f) / 128.0f;
++            pClip->samples[static_cast<std::size_t>(i) * 2u + channel] = value;
++        }
++    }
++    return true;
++}
++
++}  // namespace
++
++struct UiSounds::State {
++    Clip clips[kUiSoundCount];
++    char loaded[64] = {};
++
++    // The device's thread: queued plays wait here until its next frame takes them.
++    std::mutex lock;
++    std::vector<std::uint32_t> queued;
++
++    struct Voice {
++        const Clip* pClip = nullptr;
++        double position = 0.0;  // in the clip's own frames
++        bool playing = false;
++        std::uint64_t started = 0;
++    };
++    Voice voices[kVoices];
++    std::uint64_t started = 0;
++    // Set when the device changes rate: every voice's step is worked out per frame, so nothing to redo.
++};
++
++UiSounds::UiSounds() : state_(std::make_unique<State>()) {}
++UiSounds::~UiSounds() = default;
++
++void UiSounds::load(const char* folder) {
++    State& s = *state_;
++    std::filesystem::path dir;
++    if (folder != nullptr && folder[0] != '\0') {
++        dir = std::filesystem::path(folder);
++    } else {
++        dir = galaxy::runtime_settings_folder() / "menu-sounds";
++    }
++    std::string found;
++    for (std::uint32_t id = 0; id < kUiSoundCount; ++id) {
++        Clip& rClip = s.clips[id];
++        rClip = Clip{};
++        const std::filesystem::path path = dir / (std::string(kRoleNames[id]) + ".wav");
++        std::error_code error;
++        if (!std::filesystem::is_regular_file(path, error)) {
++            continue;
++        }
++        std::string why;
++        if (!read_wav(path, &rClip, &why)) {
++            std::fprintf(stderr, "[audio] the menu sound %s %s: left out\n", path.string().c_str(), why.c_str());
++            continue;
++        }
++        if (!found.empty()) {
++            found += ' ';
++        }
++        found += kRoleNames[id];
++    }
++    std::snprintf(s.loaded, sizeof(s.loaded), "%s", found.c_str());
++}
++
++const char* UiSounds::loaded() const {
++    return state_->loaded;
++}
++
++bool UiSounds::play(std::uint32_t id) {
++    if (id >= kUiSoundCount || !state_->clips[id].ok()) {
++        return false;
++    }
++    const std::lock_guard<std::mutex> guard(state_->lock);
++    if (state_->queued.size() >= kVoices) {
++        return true;  // already as many waiting as can sound; the newest tick is the one that matters
++    }
++    state_->queued.push_back(id);
++    return true;
++}
++
++void UiSounds::mix(float* out, std::size_t frames, std::uint32_t rate, float gain_start, float gain_end) {
++    State& s = *state_;
++    if (frames == 0u || rate == 0u) {
++        return;
++    }
++    {
++        const std::lock_guard<std::mutex> guard(s.lock);
++        for (const std::uint32_t id : s.queued) {
++            State::Voice* pVoice = nullptr;
++            for (State::Voice& rVoice : s.voices) {
++                if (!rVoice.playing) {
++                    pVoice = &rVoice;
++                    break;
++                }
++            }
++            if (pVoice == nullptr) {
++                // Full: the oldest gives way, so that the newest press is always heard.
++                pVoice = &s.voices[0];
++                for (State::Voice& rVoice : s.voices) {
++                    if (rVoice.started < pVoice->started) {
++                        pVoice = &rVoice;
++                    }
++                }
++            }
++            pVoice->pClip = &s.clips[id];
++            pVoice->position = 0.0;
++            pVoice->playing = true;
++            pVoice->started = ++s.started;
++        }
++        s.queued.clear();
++    }
++    for (State::Voice& rVoice : s.voices) {
++        if (!rVoice.playing || rVoice.pClip == nullptr) {
++            continue;
++        }
++        const Clip& rClip = *rVoice.pClip;
++        const double step = static_cast<double>(rClip.rate) / static_cast<double>(rate);
++        const std::size_t last = rClip.frames - 1u;
++        for (std::size_t i = 0; i < frames; ++i) {
++            if (rVoice.position >= static_cast<double>(last)) {
++                rVoice.playing = false;
++                break;
++            }
++            const auto whole = static_cast<std::size_t>(rVoice.position);
++            const float fraction = static_cast<float>(rVoice.position - static_cast<double>(whole));
++            const std::size_t next = whole + 1u < rClip.frames ? whole + 1u : whole;
++            const float gain = gain_start + (gain_end - gain_start) * static_cast<float>(i) / static_cast<float>(frames);
++            const float scale = gain * kSfxGain;
++            for (unsigned channel = 0; channel < 2u; ++channel) {
++                const float a = rClip.samples[whole * 2u + channel];
++                const float b = rClip.samples[next * 2u + channel];
++                out[i * 2u + channel] += (a + (b - a) * fraction) * scale;
++            }
++            rVoice.position += step;
++        }
++        if (rVoice.position >= static_cast<double>(last)) {
++            rVoice.playing = false;
++        }
++    }
++}
++
++}  // namespace galaxy::host

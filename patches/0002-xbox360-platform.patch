@@ -1,0 +1,1377 @@
+diff --git a/platform/xbox360/CMakeLists.txt b/platform/xbox360/CMakeLists.txt
+new file mode 100644
+index 0000000..4f4eeca
+--- /dev/null
++++ b/platform/xbox360/CMakeLists.txt
+@@ -0,0 +1,105 @@
++# The Xbox 360 build (docs/XBOX360.md): the console's platform layer, the Xenos device, XAudio2, XInput and the host,
++# built by the free60/libxenon cross compiler as one big-endian PowerPC image.
++#
++#   cmake -S platform/xbox360 -B build/x360 -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/xenon.toolchain.cmake
++#   cmake --build build/x360
++#
++# The console has no dynamic loader, so the host and the game module are one image: `nebula.xex`. Two targets are built
++# here and the second one needs the game module's own objects, which native/CMakeLists.txt builds with clang and which a
++# cross compiler builds only once the game module's few platform calls are console-shaped (docs/XBOX360.md, "The state of
++# the build").
++#
++#   nebula_x360_platform   the console layer alone: platform, device, audio, window, input. Compiles and links on its
++#                          own, which is what a toolchain bring-up wants first.
++#   nebula_x360            the whole title, when NEBULA_X360_GAME_OBJECTS names the game module's static libraries.
++cmake_minimum_required(VERSION 3.22)
++project(NebulaXbox360 LANGUAGES C CXX)
++
++file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/../../CMakeLists.txt" nebula_project_line REGEX "^project\\(Nebula VERSION ")
++string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" nebula_version "${nebula_project_line}")
++add_compile_definitions(NEBULA_VERSION="${nebula_version}" NEBULA_XBOX360=1)
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(CMAKE_CXX_EXTENSIONS OFF)
++
++get_filename_component(nebula_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
++set(rt "${nebula_root}/runtime/src")
++set(x360 "${CMAKE_CURRENT_SOURCE_DIR}")
++
++if(NOT XENON_CC)
++    message(WARNING
++        "No xenon-* cross compiler found: pass -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/xenon.toolchain.cmake and "
++        "point XENON_PREFIX at a free60/libxenon toolchain.")
++endif()
++
++# ---- The console layer -------------------------------------------------------------------------------------------
++
++add_library(nebula_x360_platform STATIC
++    "${x360}/xbox360_platform.cpp"
++    "${x360}/xenos_device.cpp"
++    "${x360}/host_window_xbox360.cpp"
++    "${x360}/audio_device_xbox360.cpp"
++    ${rt}/render/display_modes.cpp
++    ${rt}/perf_hint.cpp
++    ${rt}/atomic_file.cpp)
++target_include_directories(nebula_x360_platform PUBLIC
++    "${x360}" "${nebula_root}/runtime/include" "${nebula_root}/native/include")
++if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_compile_options(nebula_x360_platform PRIVATE /W4 /permissive-)
++else()
++    target_compile_options(nebula_x360_platform PRIVATE -Wall -Wextra -Wno-unused-parameter)
++endif()
++
++# ---- The title ---------------------------------------------------------------------------------------------------
++
++# The game module's objects: native/CMakeLists.txt builds them with clang's GNU driver, and on the console they are linked
++# in rather than loaded. A path list of .a/.o files, semicolon separated.
++set(NEBULA_X360_GAME_OBJECTS "" CACHE STRING "The game module's static libraries to link into nebula.xex")
++set(NEBULA_X360_PROGRAMS "${nebula_root}/build/x360/programs.xsh" CACHE FILEPATH
++    "The Xenos shader blob (tools/dev/compile_programs.py --target xenos)")
++
++if(NOT NEBULA_X360_GAME_OBJECTS)
++    message(STATUS
++        "nebula_x360: the console layer builds; the title needs NEBULA_X360_GAME_OBJECTS (docs/XBOX360.md, "
++        "'The state of the build')")
++    return()
++endif()
++
++add_executable(nebula_x360
++    "${nebula_root}/native/host/host_main.cpp"
++    ${rt}/asset_store.cpp
++    ${rt}/audio_mixer.cpp
++    ${rt}/native_audio.cpp
++    ${rt}/ui_sounds.cpp
++    ${rt}/runtime_settings.cpp
++    ${rt}/save_files.cpp
++    ${rt}/input/host_input.cpp
++    ${rt}/input/controls_engine.cpp
++    ${rt}/input/live_controls_engine.cpp
++    ${rt}/native_input.cpp
++    ${rt}/controller_roster.cpp
++    ${rt}/rumble.cpp
++    ${rt}/render/render_api.cpp
++    ${rt}/render/render_core.cpp
++    ${rt}/render/core/program_table.cpp
++    ${rt}/render/core/registries.cpp)
++target_include_directories(nebula_x360 PRIVATE
++    "${x360}" "${nebula_root}/runtime/include" "${nebula_root}/native/include")
++target_compile_definitions(nebula_x360 PRIVATE NEBULA_HOST_RENDERER=1 NEBULA_HOST_XBOX360=1
++    GALAXY_PROGRAM_BLOB="${NEBULA_X360_PROGRAMS}")
++# libxenon wraps the kernel and the console's libraries in one -lxenon; the SDK route names them, because cl.exe has no
++# umbrella library.
++if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
++    target_link_libraries(nebula_x360 PRIVATE nebula_x360_platform ${NEBULA_X360_GAME_OBJECTS}
++        xboxkrnl xapilib d3d9 xgraphics xaudio2 xinput)
++else()
++    target_link_libraries(nebula_x360 PRIVATE nebula_x360_platform ${NEBULA_X360_GAME_OBJECTS} xenon m)
++    set_target_properties(nebula_x360 PROPERTIES LINK_DEPENDS "${x360}/xbox360.ld")
++endif()
++set_target_properties(nebula_x360 PROPERTIES OUTPUT_NAME nebula SUFFIX ".elf")
++
++# The ELF is what XeLL boots over FTP or USB. A dashboard entry wants a .xex, which the SDK's image tool makes from it:
++add_custom_command(TARGET nebula_x360 POST_BUILD
++    COMMAND ${CMAKE_COMMAND} -E echo
++        "nebula.elf built; package it as a .xex with the XDK's xextool before copying it to Hdd:\\Apps\\Nebula")
+diff --git a/platform/xbox360/audio_device_xbox360.cpp b/platform/xbox360/audio_device_xbox360.cpp
+new file mode 100644
+index 0000000..59e3af5
+--- /dev/null
++++ b/platform/xbox360/audio_device_xbox360.cpp
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console's sound (audio_device.h): XAudio2's mastering voice at 48 kHz stereo, fed from a ring of buffers the game
++// mixes into on the audio worker's callback. Upstream's mixer writes float frames, so the source voice is IEEE float:
++// no conversion, and the effect bus's headroom survives to the DAC.
++#include "galaxy/audio_device.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++
++#include <xaudio2.h>
++
++#include <array>
++#include <atomic>
++#include <cstdio>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++namespace galaxy::host {
++namespace {
++
++// 512 frames a block: 10.7 ms at 48 kHz. Four blocks of ring is 42.7 ms of slack, which hides a frame that runs long
++// without the mixer having to be real-time.
++constexpr std::uint32_t kBlockFrames = 512u;
++constexpr std::uint32_t kBlocks = 4u;
++constexpr std::uint32_t kRate = 48000u;
++constexpr std::uint32_t kChannels = 2u;
++constexpr std::uint32_t kBytesPerFrame = kChannels * static_cast<std::uint32_t>(sizeof(float));
++
++class Xbox360AudioDevice final : public AudioDevice {
++public:
++    ~Xbox360AudioDevice() override { close(); }
++
++    [[nodiscard]] std::uint32_t rate() const override { return kRate; }
++
++    void start(Render render) override {
++        render_ = std::move(render);
++        blocks_.assign(static_cast<std::size_t>(kBlocks) * kBlockFrames * kChannels, 0.0f);
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            free_.clear();
++            for (std::uint32_t i = 0; i < kBlocks; ++i) {
++                free_.push_back(static_cast<std::size_t>(i));
++            }
++        }
++        running_.store(true, std::memory_order_release);
++        // Two blocks ahead before the voice starts: the first callback arrives one block-time later, and the mixer has
++        // to be able to fill it with the output never having run dry in between.
++        submit_free_blocks(2u);
++        if (voice_ == nullptr) {
++            return;  // no output: the mixer still pulls, the ring just wraps
++        }
++        (void)voice_->Start(0u, 0u);
++    }
++
++    void set_paused(bool paused) override {
++        if (voice_ == nullptr) {
++            return;
++        }
++        if (paused) {
++            (void)voice_->Stop(0u, 0u);
++        } else {
++            (void)voice_->Start(0u, 0u);
++        }
++    }
++
++    [[nodiscard]] std::uint32_t queued_frames() const override {
++        return playing_.load(std::memory_order_relaxed) * kBlockFrames;
++    }
++
++    void open_engine() {
++        if (FAILED(XAudio2Create(&engine_, 0u, XAUDIO2_DEFAULT_PROCESSOR))) {
++            std::fprintf(stderr, "[audio] XAudio2 refused: no output\n");
++            return;
++        }
++        if (FAILED(engine_->CreateMasteringVoice(&master_, kChannels, kRate, 0u, nullptr, nullptr,
++                                                 AudioCategory_GameEffects))) {
++            std::fprintf(stderr, "[audio] no mastering voice: no output\n");
++            release();
++            return;
++        }
++        WAVEFORMATEX format{};
++        format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
++        format.nChannels = static_cast<WORD>(kChannels);
++        format.nSamplesPerSec = kRate;
++        format.wBitsPerSample = 32u;
++        format.nBlockAlign = static_cast<WORD>(kBytesPerFrame);
++        format.nAvgBytesPerSec = kRate * format.nBlockAlign;
++        if (FAILED(engine_->CreateSourceVoice(&voice_, &format, 0u, XAUDIO2_DEFAULT_FREQ_RATIO, &callback_, nullptr,
++                                              nullptr))) {
++            std::fprintf(stderr, "[audio] no source voice: no output\n");
++            release();
++        }
++    }
++
++private:
++    // XAudio2's worker: a block has played, so its memory is free and the mixer owes the next one.
++    class Callback final : public IXAudio2VoiceCallback {
++    public:
++        explicit Callback(Xbox360AudioDevice* owner) : owner_(owner) {}
++        void STDMETHODCALLTYPE OnBufferEnd(void* context) override {
++            owner_->block_finished(static_cast<std::size_t>(reinterpret_cast<std::uintptr_t>(context)));
++        }
++        void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) override {}
++        void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
++        void STDMETHODCALLTYPE OnStreamEnd() override {}
++        void STDMETHODCALLTYPE OnBufferStart(void*) override {}
++        void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
++        void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) override {}
++
++    private:
++        Xbox360AudioDevice* owner_;
++    };
++
++    void block_finished(std::size_t index) {
++        playing_.fetch_sub(1u, std::memory_order_relaxed);
++        {
++            std::lock_guard<std::mutex> lock(mutex_);
++            free_.push_back(index);
++        }
++        if (running_.load(std::memory_order_acquire)) {
++            submit_free_blocks(1u);
++        }
++    }
++
++    // Fills and submits up to `count` free blocks. Everything under the lock is the ring's bookkeeping; the mix itself
++    // runs outside it, so a long render call cannot stall the callback that is freeing blocks behind it.
++    void submit_free_blocks(std::uint32_t count) {
++        for (std::uint32_t i = 0; i < count; ++i) {
++            std::size_t index = 0u;
++            {
++                std::lock_guard<std::mutex> lock(mutex_);
++                if (free_.empty()) {
++                    return;
++                }
++                index = free_.front();
++                free_.pop_front();
++            }
++            float* const block = blocks_.data() + index * kBlockFrames * kChannels;
++            if (render_) {
++                render_(block, kBlockFrames, kRate);
++            }
++            if (voice_ == nullptr) {
++                std::lock_guard<std::mutex> lock(mutex_);
++                free_.push_back(index);  // no device: the ring stays whole
++                return;
++            }
++            XAUDIO2_BUFFER buffer{};
++            buffer.Flags = 0u;
++            buffer.AudioBytes = kBlockFrames * kBytesPerFrame;
++            buffer.pAudioData = reinterpret_cast<const BYTE*>(block);
++            buffer.pContext = reinterpret_cast<void*>(static_cast<std::uintptr_t>(index));
++            if (FAILED(voice_->SubmitSourceBuffer(&buffer))) {
++                std::lock_guard<std::mutex> lock(mutex_);
++                free_.push_back(index);
++                return;
++            }
++            playing_.fetch_add(1u, std::memory_order_relaxed);
++        }
++    }
++
++    void release() {
++        if (voice_ != nullptr) {
++            (void)voice_->Stop(0u, 0u);
++            voice_->DestroyVoice();
++            voice_ = nullptr;
++        }
++        if (master_ != nullptr) {
++            master_->DestroyVoice();
++            master_ = nullptr;
++        }
++        if (engine_ != nullptr) {
++            engine_->Release();
++            engine_ = nullptr;
++        }
++        playing_.store(0u, std::memory_order_relaxed);
++    }
++
++    void close() {
++        running_.store(false, std::memory_order_release);
++        release();
++        blocks_.clear();
++    }
++
++    IXAudio2* engine_ = nullptr;
++    IXAudio2MasteringVoice* master_ = nullptr;
++    IXAudio2SourceVoice* voice_ = nullptr;
++    Callback callback_{this};
++    Render render_;
++    std::vector<float> blocks_;
++    std::deque<std::size_t> free_;
++    mutable std::mutex mutex_;
++    std::atomic<std::uint32_t> playing_{0u};
++    std::atomic<bool> running_{false};
++};
++
++}  // namespace
++
++std::unique_ptr<AudioDevice> open_audio_device() {
++    // The engine is created here rather than in start() so a title that never reaches the mixer still reports the
++    // console's real output state at boot.
++    auto device = std::make_unique<Xbox360AudioDevice>();
++    device->open_engine();
++    return device;
++}
++
++void set_audio_thread_name() {
++    // The name is the profiler's; the pin is what matters on this machine (xbox360_tuning.h, kThreads.audio).
++    if (!x360::pin_this_thread(x360::kThreads.audio)) {
++        std::fprintf(stderr, "[audio] the kernel kept the mixer off core 3\n");
++    }
++}
++
++}  // namespace galaxy::host
+diff --git a/platform/xbox360/host_window_xbox360.cpp b/platform/xbox360/host_window_xbox360.cpp
+new file mode 100644
+index 0000000..c66ddf5
+--- /dev/null
++++ b/platform/xbox360/host_window_xbox360.cpp
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The game's window on the console (host_window.h): a 1280x720 D3D9 device whose resolved frame the scaler fits to the
++// panel, presents paced by the display's refresh, the pad's exit chord, and the answers the settings menu asks a desktop
++// for (monitors, file pickers, upscalers) that a console does not have.
++//
++// A title owns the machine: there is no window manager, no second monitor and no desktop. The "window" is the device
++// itself (xenos_device.cpp), and its client extent is the frame's.
++#include "galaxy/render/host_window.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++#include "xenos_device.h"
++
++#include <d3d9.h>
++#include <xinput.h>
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace galaxy::render::host_window {
++namespace {
++
++// The handle open_game_window hands the renderer: on a console it identifies the device, not a window.
++struct Device {
++    IDirect3DDevice9* device = nullptr;
++};
++
++Device g_window;
++std::atomic<std::uint64_t> g_present_count{0u};
++std::uint64_t g_present_window_start_us = 0u;
++
++// The dashboard's guide closes a title. To the title that is Start+Back in one poll; two seconds of it is the request.
++constexpr std::uint64_t kExitChordHoldUs = 2000000u;
++std::uint64_t g_exit_chord_since_us = 0u;
++
++void poll_exit_chord() {
++    XINPUT_STATE state{};
++    if (XInputGetState(0u, &state) != ERROR_SUCCESS) {
++        g_exit_chord_since_us = 0u;
++        return;
++    }
++    constexpr WORD kChord = XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK;
++    const bool held = (state.Gamepad.wButtons & kChord) == kChord;
++    const std::uint64_t now = x360::now_us();
++    if (!held) {
++        g_exit_chord_since_us = 0u;
++        return;
++    }
++    if (g_exit_chord_since_us == 0u) {
++        g_exit_chord_since_us = now;
++    } else if (now - g_exit_chord_since_us >= kExitChordHoldUs) {
++        quit_request.store(true, std::memory_order_relaxed);
++    }
++}
++
++}  // namespace
++
++unsigned backbuffer_width = static_cast<unsigned>(x360::kFrameWidth);
++unsigned backbuffer_height = static_cast<unsigned>(x360::kFrameHeight);
++std::atomic<double> measured_present_hz{0.0};
++std::atomic<std::int32_t> pointer_wheel{0};
++std::atomic<bool> borderless_active{true};
++std::atomic<bool> move_size_active{false};
++std::atomic<bool> quit_request{false};
++std::atomic<std::uint64_t> pending_resize_extent{0u};
++std::atomic<bool> surface_withdrawn{false};
++std::timed_mutex surface_use;
++std::atomic<bool> ray_tracing_offered{false};
++std::atomic<bool> rtx_adapter{false};
++
++bool hidden_window_mode_enabled() {
++    return false;  // a title is always on the screen; there is no tray to start hidden in
++}
++
++OpenedWindow open_game_window(WindowOwner&, int window_width, int window_height) {
++    OpenedWindow opened;
++    (void)window_width;
++    (void)window_height;  // the frame is the mode's: 1280x720 at 60 Hz (xbox360_tuning.h)
++    x360::XenosDevice& device = x360::xenos();
++    if (!device.open()) {
++        x360::log_line(nullptr, "[video] the Xenos device did not open");
++        return opened;
++    }
++    g_window.device = device.device();
++    backbuffer_width = static_cast<unsigned>(x360::kFrameWidth);
++    backbuffer_height = static_cast<unsigned>(x360::kFrameHeight);
++    borderless_active.store(true, std::memory_order_relaxed);
++    opened.window = reinterpret_cast<NativeWindow>(&g_window);
++    opened.shown = true;
++    return opened;
++}
++
++IDirect3DDevice9* window_device() {
++    return x360::xenos().device();
++}
++
++void close_game_window(WindowOwner&) noexcept {
++    g_window.device = nullptr;
++    x360::xenos().close();
++}
++
++void show_window(NativeWindow) noexcept {}
++
++double display_refresh_hz(NativeWindow) noexcept {
++    return static_cast<double>(x360::kFrameHz);
++}
++
++void set_state_wake(void* event) noexcept {
++    // A title has no window state to wake on; the guide's chord is polled by the present.
++    (void)event;
++}
++
++bool vblank_grid_known(std::int64_t& vblank, std::int64_t& period) noexcept {
++    // The blank arrives with the present: the grid is one frame at the mode's rate, placed by the last swap.
++    period = 1000000000ll / static_cast<std::int64_t>(x360::kFrameHz);
++    vblank = static_cast<std::int64_t>(x360::xenos().presents() * static_cast<std::uint64_t>(period));
++    return true;
++}
++
++bool vblank_grid(NativeWindow, std::int64_t& vblank, std::int64_t& period) noexcept {
++    return vblank_grid_known(vblank, period);
++}
++
++bool present_grid(std::int64_t& slot_ns, std::int64_t& period_ns, std::int64_t& vsync_ns,
++                  std::int64_t& now_ns) noexcept {
++    // The console's present blocks until the scanout has the frame, so the game's frames are already on the display's
++    // grid: there is nothing for the host to schedule.
++    (void)slot_ns;
++    (void)period_ns;
++    (void)vsync_ns;
++    (void)now_ns;
++    return false;
++}
++
++std::vector<SettingsMonitor> settings_monitors() {
++    // One monitor: the panel the dashboard is on, with the GPU's scaler fitting the title's 1280x720 to it. The settings
++    // menu offers no mode list for it, because the mode is the console's.
++    const x360::Machine machine = x360::machine();
++    SettingsMonitor monitor;
++    monitor.id = "panel";
++    monitor.name = "TV";
++    monitor.width = machine.panel_width;
++    monitor.height = machine.panel_height;
++    monitor.refresh_hz = machine.panel_hz;
++    monitor.max_client_width = static_cast<long>(x360::kFrameWidth);
++    monitor.max_client_height = static_cast<long>(x360::kFrameHeight);
++    monitor.primary = true;
++    return {monitor};
++}
++
++bool window_modal_active() noexcept {
++    return false;
++}
++
++void test_resize_window(unsigned long, unsigned long) noexcept {}
++
++void pick_files(FilePick, std::function<void(std::vector<std::filesystem::path>)> done) {
++    // A console has no file picker. What a picker would return is the package's own layout (game_paths.h): the folders
++    // the install scripts put mods, saves and Miis in.
++    if (done) {
++        done({});
++    }
++}
++
++void open_folder(const std::filesystem::path&) {}
++
++bool folders_open() noexcept {
++    return false;
++}
++
++UpscalerCaps upscaler_caps() noexcept {
++    UpscalerCaps caps;
++    // The console's scaler is the GPU's own: no DLSS, no XeSS, no frame generation, and no vendor files to install.
++    // The port's FSR 1 path is a shader and stays on offer.
++    caps.frames_presented = 1u;
++    return caps;
++}
++
++unsigned dlss_min_width(unsigned, unsigned width, unsigned) noexcept {
++    return width;
++}
++
++bool launcher_available() {
++    return false;
++}
++
++bool dlss_files_present() {
++    return false;
++}
++
++bool xess_files_present() {
++    return false;
++}
++
++bool frame_generation_files_present() {
++    return false;
++}
++
++unsigned vendor_megabytes(unsigned) {
++    return 0u;
++}
++
++bool start_vendor_install(unsigned) {
++    return false;
++}
++
++void cancel_vendor_install() {}
++
++VendorInstall poll_vendor_install(unsigned& percent) {
++    percent = 100u;
++    return VendorInstall::Failed;  // nothing to install: the caps offer nothing that needs files
++}
++
++void fetch_vendor_license(unsigned) {}
++
++VendorLicense vendor_license(std::string& text) {
++    text.clear();
++    return VendorLicense::Failed;
++}
++
++bool restart_game(bool) {
++    // A title restarts by exiting: the dashboard runs it again from the store it came from.
++    quit_request.store(true, std::memory_order_relaxed);
++    return true;
++}
++
++// Ends a frame: the scene's tiles are closed, the multisampled target is resolved into the texture the scaler reads,
++// and the present ties the frame to the panel. The D3D9 renderer calls it once a frame, with the frame already drawn.
++void present_frame() {
++    poll_exit_chord();
++    (void)x360::xenos().resolve_and_present(true);
++    g_present_count.fetch_add(1u, std::memory_order_relaxed);
++    const std::uint64_t now = x360::now_us();
++    if (g_present_window_start_us == 0u) {
++        g_present_window_start_us = now;
++        return;
++    }
++    const std::uint64_t elapsed = now - g_present_window_start_us;
++    if (elapsed >= 1000000u) {
++        const auto frames = g_present_count.exchange(0u, std::memory_order_relaxed);
++        measured_present_hz.store(static_cast<double>(frames) * 1000000.0 / static_cast<double>(elapsed),
++                                  std::memory_order_relaxed);
++        g_present_window_start_us = now;
++    }
++}
++
++}  // namespace galaxy::render::host_window
+diff --git a/platform/xbox360/toolchain-xbox360.cmake b/platform/xbox360/toolchain-xbox360.cmake
+new file mode 100644
+index 0000000..fec326e
+--- /dev/null
++++ b/platform/xbox360/toolchain-xbox360.cmake
+@@ -0,0 +1,39 @@
++# The Xbox 360 SDK's toolchain, as CMake sees it (platform/xbox360/CMakeLists.txt).
++#
++#   XEDK=/c/Xbox360/SDK cmake -S platform/xbox360 -B build/xbox360 \
++#       -DCMAKE_TOOLCHAIN_FILE=platform/xbox360/toolchain-xbox360.cmake -G Ninja
++#
++# The SDK ships a PowerPC-targeted cl.exe, the Xenon libraries, and the umbrella headers. Everything below is read from
++# the SDK's own layout, so a newer drop of the SDK needs no edit here.
++cmake_minimum_required(VERSION 3.22)
++
++set(CMAKE_SYSTEM_NAME Xbox360)
++set(CMAKE_SYSTEM_PROCESSOR xenon)
++
++if(NOT DEFINED ENV{XEDK} OR NOT IS_DIRECTORY "$ENV{XEDK}")
++    message(FATAL_ERROR "Set XEDK to the Xbox 360 SDK's root (the folder holding bin/win32 and include/xbox360).")
++endif()
++set(XEDK "$ENV{XEDK}" CACHE PATH "Xbox 360 SDK root")
++
++# The target we build for: the console, not the SDK's host tools.
++set(XBOX360 ON CACHE BOOL "The Xbox 360 target" FORCE)
++set(CMAKE_C_COMPILER "${XEDK}/bin/win32/cl.exe")
++set(CMAKE_CXX_COMPILER "${XEDK}/bin/win32/cl.exe")
++set(CMAKE_ASM_COMPILER "${XEDK}/bin/win32/cl.exe")
++
++# The Xenon headers and libraries. xbox360 is the console's umbrella set (xtl.h, d3d9.h, xaudio2.h, xinput.h).
++set(X360_INCLUDE "${XEDK}/include/xbox360")
++set(X360_LIB "${XEDK}/lib/xbox360")
++include_directories(SYSTEM "${X360_INCLUDE}")
++link_directories("${X360_LIB}")
++
++# /D_XBOX360 selects the console branches in the SDK's own headers; the ports that matter here are the PowerPC ABI and
++# the VMX (AltiVec) unit upstream's maths already reaches for.
++set(CMAKE_CXX_FLAGS_INIT "/D_XBOX360 /EHsc /GR- /O2 /GS- /fp:fast /arch:SSE2")
++set(CMAKE_C_FLAGS_INIT "/D_XBOX360 /O2 /GS-")
++set(CMAKE_EXE_LINKER_FLAGS_INIT "/LIBPATH:\"${X360_LIB}\"")
++
++set(CMAKE_FIND_ROOT_PATH "${XEDK}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+diff --git a/platform/xbox360/xbox360_apis.h b/platform/xbox360/xbox360_apis.h
+new file mode 100644
+index 0000000..d6e6123
+--- /dev/null
++++ b/platform/xbox360/xbox360_apis.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The Xbox 360 SDK entry points the platform layer calls that have no header of their own in the console's umbrella
++// (xtl.h): the graphics library's swizzle-into-a-tiled-surface call, the video mode, the thread-to-core pin, and the
++// profiler's thread name.
++//
++// The 360's D3D9, XAudio2 and XInput are the same interfaces Windows has and come from their own headers; only these
++// four are declared here. The signatures below are the 360 SDK's (Xbox 360 SDK 2.0.21256.2); if a toolchain's headers
++// give them differently, keep the headers and correct these four declarations -- nothing else in the port names them.
++#pragma once
++
++#if defined(NEBULA_XBOX360)
++
++#include <xtl.h>
++#include <xgraphics.h>
++
++namespace galaxy::host::x360::api {
++
++// Places a rectangle of pixels into a tiled surface: source pitch in bytes (0 keeps the destination's), then the
++// destination, its width and height in texels, and the texel size. The 360's textures are tiled by 32x32 blocks and
++// the driver owns that layout; this is the one call that writes rows into it correctly.
++void XGSwizzleRect(const void* pSource, DWORD pitch, const RECT* pSourceRect, void* pDest, DWORD width, DWORD height,
++                   const RECT* pDestRect, DWORD bytesPerPixel);
++
++// The console's current video mode: the panel's resolution, whether it is interlaced, and the aspect the player's
++// dashboard is set to. A title cannot change it; it renders into it.
++BOOL XGetVideoMode(XVIDEO_MODE* pMode);
++
++// Asks the scaler for the mode the title renders in (1280x720, progressive) -- the panel stays as it is and the GPU's
++// scaler fits the frame to it.
++BOOL XVideoSetMode(WORD width, WORD height, DWORD flags, WORD refresh);
++
++// The core a thread runs on (0-5; core 0 thread 0 is the kernel's). False when the thread has ended.
++BOOL XSetThreadProcessor(HANDLE hThread, DWORD processor);
++
++// The profiler's name for a thread.
++void XSetThreadName(HANDLE hThread, const char* pName);
++
++}  // namespace galaxy::host::x360::api
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xbox360_platform.cpp b/platform/xbox360/xbox360_platform.cpp
+new file mode 100644
+index 0000000..187b0a9
+--- /dev/null
++++ b/platform/xbox360/xbox360_platform.cpp
+@@ -0,0 +1,171 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console itself (xbox360_platform.h): the scaler's mode, the memory the title may still take, the log on the hard
++// disk, and the core a thread runs on. Nothing here draws or makes a sound; it is what the other layers ask the
++// machine for.
++#include "xbox360_platform.h"
++
++#include "xbox360_apis.h"
++#include "xbox360_tuning.h"
++
++#include "galaxy/platform_time.h"
++
++#include <cstdarg>
++#include <cstdio>
++#include <cstring>
++
++namespace galaxy::host::x360 {
++namespace {
++
++// The scaler's mode as the dashboard left it, read once: a title cannot change the panel, only what the GPU's scaler
++// fits onto it.
++struct Panel {
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    std::uint32_t hz = 0;
++    bool widescreen = false;
++    bool interlaced = false;
++};
++
++Panel read_panel() {
++    Panel panel;
++    XVIDEO_MODE mode{};
++    if (api::XGetVideoMode(&mode) == FALSE) {
++        return panel;
++    }
++    panel.width = mode.dwDisplayWidth;
++    panel.height = mode.dwDisplayHeight;
++    panel.hz = mode.dwRefreshRate;
++    panel.widescreen = mode.fIsWideScreen != FALSE;
++    panel.interlaced = mode.fIsInterlaced != FALSE;
++    return panel;
++}
++
++Panel g_panel;
++bool g_video_mode_set = false;
++std::FILE* g_log = nullptr;
++
++}  // namespace
++
++// Reads the machine and logs it: the memory, the panel, the cores. False when the console's video mode could not be
++// read, which on hardware means the title was launched without a display.
++bool start() {
++    // 1280x720 progressive: the EDRAM holds the frame at 2x multisampling in one predicated tile (xbox360_tuning.h),
++    // and the scaler fits it to whatever panel the player's dashboard is on.
++    g_video_mode_set = api::XVideoSetMode(static_cast<WORD>(kFrameWidth), static_cast<WORD>(kFrameHeight), 0u,
++                                          static_cast<WORD>(kFrameHz)) != FALSE;
++    g_panel = read_panel();
++    if (g_panel.width == 0u) {
++        std::fprintf(stderr, "[x360] no video mode: the title was started without a display\n");
++        return false;
++    }
++    const Machine now = machine();
++    std::fprintf(stderr, "[x360] panel %ux%u %u Hz%s%s, %u of %u MB free, %u hardware threads, video mode %s\n",
++                 now.panel_width, now.panel_height, now.panel_hz, now.widescreen ? " wide" : " 4:3",
++                 now.interlaced ? " interlaced" : "", now.memory_free_mb, now.memory_total_mb, kHardwareThreads,
++                 g_video_mode_set ? "1280x720@60" : "the scaler refused, left as found");
++    return true;
++}
++
++Machine machine() {
++    Machine result;
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    result.memory_total_mb = static_cast<std::uint32_t>(status.dwTotalPhys / (1024u * 1024u));
++    result.memory_free_mb = static_cast<std::uint32_t>(status.dwAvailPhys / (1024u * 1024u));
++    result.panel_width = g_panel.width;
++    result.panel_height = g_panel.height;
++    result.panel_hz = g_panel.hz;
++    result.widescreen = g_panel.widescreen;
++    result.interlaced = g_panel.interlaced;
++    return result;
++}
++
++std::FILE* open_log(const char* path) {
++    if (path == nullptr || path[0] == '\0') {
++        return nullptr;
++    }
++    // A title's working directory is the package's: the log lives beside it, on whichever store the package was started
++    // from (Hdd:, Usb0:, …), so a run on a player's console leaves something to read back.
++    std::FILE* const log = std::fopen(path, "a");
++    if (log == nullptr) {
++        return nullptr;
++    }
++    g_log = log;
++    return log;
++}
++
++// The console's debug channel is the title's stderr (the debug monitor and XeLL both read it); the file is the run's
++// own copy on the store, for a session nobody was watching. A line goes to both.
++void log_line(std::FILE* log, const char* text) noexcept {
++    std::fputs(text, stderr);
++    std::fputc('\n', stderr);
++    if (log == nullptr) {
++        return;
++    }
++    std::fputs(text, log);
++    std::fputc('\n', log);
++    std::fflush(log);
++}
++
++void log_line(std::FILE* log, const char* format, ...) noexcept {
++    char line[1024];
++    std::va_list args;
++    va_start(args, format);
++    std::vsnprintf(line, sizeof(line), format, args);
++    va_end(args);
++    log_line(log, line);
++}
++
++bool pin_this_thread(std::uint32_t processor) {
++    if (processor >= kHardwareThreads) {
++        return false;
++    }
++    return api::XSetThreadProcessor(GetCurrentThread(), processor) != FALSE;
++}
++
++std::uint32_t this_thread_processor() {
++    // The SDK has no getter: a thread's processor is what it was pinned to, and the port pins every thread it starts.
++    // The platform's own work (the boot, the log) runs wherever the kernel put it, so the value is only used for the
++    // report, where 0xFFFFFFFF means "not pinned".
++    return 0xFFFFFFFFu;
++}
++
++std::uint32_t memory_free_bytes() {
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    const auto free = static_cast<std::uint32_t>(status.dwAvailPhys);
++    // A texture upload in flight holds a frame's worth of staging: hand back what is left after it, never a number the
++    // game could spend twice.
++    const std::uint32_t reserve = 8u * 1024u * 1024u;
++    return free > reserve ? free - reserve : 0u;
++}
++
++std::uint32_t memory_total_bytes() {
++    MEMORYSTATUS status{};
++    GlobalMemoryStatus(&status);
++    return static_cast<std::uint32_t>(status.dwTotalPhys);
++}
++
++std::uint64_t now_us() noexcept {
++    // The time base is 50 MHz, so a microsecond is 50 ticks and the division is exact.
++    return galaxy::xbox360_time_base() / (kTimeBaseHz / 1000000u);
++}
++
++void shutdown() {
++    if (g_log != nullptr) {
++        std::fflush(g_log);
++        std::fclose(g_log);
++        g_log = nullptr;
++    }
++    // The scaler's mode is the dashboard's again: a title that exits leaves the panel as it found it.
++    if (g_video_mode_set) {
++        XVIDEO_MODE mode{};
++        if (api::XGetVideoMode(&mode) != FALSE) {
++            (void)api::XVideoSetMode(static_cast<WORD>(mode.dwDisplayWidth), static_cast<WORD>(mode.dwDisplayHeight),
++                                     0u, static_cast<WORD>(mode.dwRefreshRate));
++        }
++        g_video_mode_set = false;
++    }
++}
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xbox360_platform.h b/platform/xbox360/xbox360_platform.h
+new file mode 100644
+index 0000000..7504ec1
+--- /dev/null
++++ b/platform/xbox360/xbox360_platform.h
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console, as the port's other layers need it: the boot sequence (the mode the scaler is asked for, the kernel's
++// memory, the log on the hard disk), the core a thread is pinned to, and the memory the frame may still ask for.
++#pragma once
++
++#include <cstdint>
++#include <cstdio>
++
++namespace galaxy::host::x360 {
++
++struct Machine {
++    std::uint32_t memory_total_mb = 0;
++    std::uint32_t memory_free_mb = 0;
++    std::uint32_t panel_width = 0;    // what the scaler is putting the frame on
++    std::uint32_t panel_height = 0;
++    std::uint32_t panel_hz = 0;
++    bool widescreen = false;          // the dashboard's aspect setting
++    bool interlaced = false;
++};
++
++// Reads the machine and logs it: the memory, the panel, the cores. False when the console's video mode could not be
++// read, which on hardware means the title was launched without a display.
++bool start();
++
++// The same read again (a title's free memory moves; the panel can change under it while the guide is up).
++[[nodiscard]] Machine machine();
++
++// `path` opened for append as the run's log ("Hdd:\\Nebula\\nebula.log"); null when it cannot be.
++std::FILE* open_log(const char* path);
++void log_line(std::FILE* log, const char* text) noexcept;
++void log_line(std::FILE* log, const char* format, ...) noexcept;
++
++// Pins the calling thread to a hardware thread of kThreads (xbox360_tuning.h). False when the kernel refused.
++bool pin_this_thread(std::uint32_t processor);
++
++// The hardware thread the caller runs on, 0-5, or 0xFFFFFFFF when the kernel does not say.
++[[nodiscard]] std::uint32_t this_thread_processor();
++
++// What the title may still allocate: the kernel's free bytes, less the reserve a texture upload needs in flight.
++[[nodiscard]] std::uint32_t memory_free_bytes();
++[[nodiscard]] std::uint32_t memory_total_bytes();
++
++// The frame's tick: the console's 50 MHz time base, in microseconds (a whole number, wrapping-safe).
++[[nodiscard]] std::uint64_t now_us() noexcept;
++
++// The run's end: the log closed, the scaler's mode left as it was found.
++void shutdown();
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xbox360_render.h b/platform/xbox360/xbox360_render.h
+new file mode 100644
+index 0000000..49badc1
+--- /dev/null
++++ b/platform/xbox360/xbox360_render.h
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The console's frame, as the D3D9 renderer and the window share it: the device one frame is drawn into, and the
++// present that swaps it onto the scaler. The window owns both; the renderer only asks.
++#pragma once
++
++#if defined(NEBULA_XBOX360)
++
++struct IDirect3DDevice9;
++
++namespace galaxy::render::host_window {
++
++// The device open_game_window made. Null before the window opens and after it closes.
++[[nodiscard]] IDirect3DDevice9* window_device();
++
++// The frame is drawn: waits for the display, then swaps. Called once a frame by the renderer's present.
++void present_frame();
++
++}  // namespace galaxy::render::host_window
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xbox360_tuning.h b/platform/xbox360/xbox360_tuning.h
+new file mode 100644
+index 0000000..361cc23
+--- /dev/null
++++ b/platform/xbox360/xbox360_tuning.h
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// The numbers the Xbox 360 build runs by: what the console gives, how its 512 MB is split between the port's caches,
++// and what one frame of a 60 Hz game may spend. Everything here is a constant of the machine or a budget the port
++// keeps; the player's own settings stay in runtime_settings.ini.
++#pragma once
++
++#include <cstdint>
++
++namespace galaxy::host::x360 {
++
++// ---- The machine -------------------------------------------------------------------------------------------------
++
++inline constexpr std::uint32_t kTimeBaseHz = 50000000u;  // Xenon's time base, all three cores and the GPU
++inline constexpr std::uint32_t kHardwareThreads = 6u;    // three cores, two threads each
++inline constexpr std::uint32_t kConsoleMemoryBytes = 512u * 1024u * 1024u;
++// What a title gets: the hypervisor and the kernel keep the rest. The dashboard's guide is not resident in a title.
++inline constexpr std::uint32_t kUsableMemoryBytes = 480u * 1024u * 1024u;
++inline constexpr std::uint32_t kEdramBytes = 10u * 1024u * 1024u;  // the daughter die's framebuffer
++// One predicated tile, at 720p: half the frame's height, 1280x360, 2x multisampled 32-bit colour plus 2x multisampled
++// 32-bit depth is 7,372,800 bytes (7.03 MiB). Two of those in turn fill the frame and leave the rest of the EDRAM for
++// the resolve.
++inline constexpr std::uint32_t kEdramTileBytes = 7u * 1024u * 1024u;
++
++// ---- The picture -------------------------------------------------------------------------------------------------
++
++// 1280x720 is the console's own HD mode: the GPU's scaler puts it on a 1080p panel, and the EDRAM holds a 32-bit
++// colour target plus a 32-bit depth target at 2x multisampling in two predicated tiles (7.4 MB a tile, 512 KB of the
++// 10 MB spare for the resolve).
++inline constexpr int kFrameWidth = 1280;
++inline constexpr int kFrameHeight = 720;
++inline constexpr int kFrameHz = 60;
++inline constexpr int kMultisample = 2;
++inline constexpr bool kPredicatedTiling = true;
++
++// One frame: 16.67 ms. The game's own share of it, the renderer's submit, and what the display's refresh leaves.
++struct FrameBudget {
++    float game_ms;      // simulation, physics, animation, the game's own draws built
++    float submit_ms;    // command buffer recording and the kick
++    float audio_ms;     // one XAudio pull, on its own thread
++    float slack_ms;
++};
++inline constexpr FrameBudget kFrameBudget{10.5f, 4.0f, 0.8f, 1.3f};
++inline constexpr int kFrameBudgetMs = 16;  // the same, whole, for the frame limiter
++
++// ---- The memory split --------------------------------------------------------------------------------------------
++
++// 480 MB, in the order a frame touches it. A pool is sized once at boot and never grows: the console's allocator
++// fragments under a long session, and the game's own heap is the one that must not.
++struct MemorySplit {
++    std::uint32_t pak_stream_mb;   // the cooked pak's read-ahead and the disc/HDD streaming ring
++    std::uint32_t textures_mb;     // GPU-visible, D3DPOOL_DEFAULT: the scene's textures and the resolve targets
++    std::uint32_t geometry_mb;     // vertex and index buffers, static and per-frame
++    std::uint32_t audio_mb;        // music and effects, plus the XMA decoder's own buffers
++    std::uint32_t game_heap_mb;    // the game module and the host's own allocations
++    std::uint32_t shaders_mb;      // the compiled Xenos shader blobs and the state blocks
++    std::uint32_t spare_mb;
++};
++inline constexpr MemorySplit kMemory{192u, 128u, 48u, 36u, 68u, 4u, 4u};
++
++// ---- Threads -----------------------------------------------------------------------------------------------------
++
++// Core 0 thread 0 belongs to the kernel and the dashboard's guide: the port keeps off it. The two game threads (the
++// host and the game module's own worker) sit on core 2 apart from the renderer's submit, and audio has a core of its
++// own so a long frame cannot starve the mixer.
++struct ThreadPlan {
++    std::uint32_t game_processor;   // the frame's simulation
++    std::uint32_t game_helper;      // the game module's job thread
++    std::uint32_t render;           // command recording and the kick
++    std::uint32_t audio;            // the XAudio render driver
++    std::uint32_t streaming;        // pak reads and texture uploads
++};
++inline constexpr ThreadPlan kThreads{2u, 4u, 5u, 3u, 1u};
++
++// ---- Streaming ---------------------------------------------------------------------------------------------------
++
++// The disc peaks at about 12 MB/s on the outer edge, an installed hard disk at 60 MB/s. A pak read is a 64 KB request
++// with the next four queued behind it, so a level's textures arrive before the frame that wants them.
++inline constexpr std::uint32_t kReadChunkBytes = 64u * 1024u;
++inline constexpr std::uint32_t kReadQueueDepth = 5u;
++inline constexpr std::uint32_t kTextureUploadBytesPerFrame = 2u * 1024u * 1024u;
++
++// ---- The shader cache --------------------------------------------------------------------------------------------
++
++// Xenos runs Shader Model 3.0 vertex and pixel programs; the port's GX programs are the same HLSL compiled for it
++// (tools/dev/compile_programs.py --target xenos, on a Windows host with the SDK's ps_3_0/vs_3_0 compiler). One blob per
++// program and variant, in the package beside the game's data.
++inline constexpr const char* kShaderCacheFile = "programs.xsh";
++inline constexpr std::uint32_t kShaderBlobAlign = 128u;  // the Xenos's shader fetch wants a 128-byte boundary
++
++}  // namespace galaxy::host::x360
+diff --git a/platform/xbox360/xenos_device.cpp b/platform/xbox360/xenos_device.cpp
+new file mode 100644
+index 0000000..f9bd94b
+--- /dev/null
++++ b/platform/xbox360/xenos_device.cpp
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Xenos: the device, the EDRAM scene, the resolve and the present (xenos_device.h).
++//
++// The 360 speaks D3D9 with a handful of its own extensions: the driver keeps render targets in the daughter die's
++// 10 MB, a scene that does not fit is drawn in predicated tiles (BeginTiling/EndTiling), and a multisampled target is
++// resolved into a texture the scaler can read. Those extensions are the SDK's; a toolchain that spells them
++// differently changes these calls and nothing above them.
++#include "xenos_device.h"
++
++#include "xbox360_platform.h"
++#include "xbox360_tuning.h"
++
++#if defined(NEBULA_XBOX360)
++#include "xbox360_apis.h"
++
++#include <cstdio>
++
++namespace galaxy::host::x360 {
++namespace {
++
++D3DFORMAT format_of(TextureDesc::Format format) {
++    switch (format) {
++    case TextureDesc::Format::Bgra8:
++        return D3DFMT_A8R8G8B8;
++    case TextureDesc::Format::Bc1:
++        return D3DFMT_DXT1;
++    case TextureDesc::Format::Bc2:
++        return D3DFMT_DXT3;
++    case TextureDesc::Format::Bc3:
++    case TextureDesc::Format::Dxt5:
++        return D3DFMT_DXT5;
++    case TextureDesc::Format::Rgba8:
++        return D3DFMT_A8B8G8R8;
++    case TextureDesc::Format::R8:
++        return D3DFMT_L8;
++    }
++    return D3DFMT_A8R8G8B8;
++}
++
++std::uint32_t texel_bytes(TextureDesc::Format format) {
++    switch (format) {
++    case TextureDesc::Format::Bgra8:
++    case TextureDesc::Format::Rgba8:
++        return 4u;
++    case TextureDesc::Format::R8:
++        return 1u;
++    case TextureDesc::Format::Bc1:
++    case TextureDesc::Format::Bc2:
++    case TextureDesc::Format::Bc3:
++    case TextureDesc::Format::Dxt5:
++        return 0u;  // 4x4 blocks: the swizzle takes the block size, not a texel
++    }
++    return 4u;
++}
++
++}  // namespace
++
++struct XenosDevice::State {
++    IDirect3D9* d3d = nullptr;
++    IDirect3DDevice9* device = nullptr;
++    IDirect3DTexture9* color = nullptr;
++    IDirect3DSurface9* color_surface = nullptr;
++    IDirect3DTexture9* resolved = nullptr;
++    IDirect3DTexture9* depth = nullptr;
++    std::uint64_t presents = 0u;
++    bool tiling = false;
++    bool open = false;
++};
++
++XenosDevice::XenosDevice() : state_(std::make_unique<State>()) {}
++
++XenosDevice::~XenosDevice() { close(); }
++
++XenosDevice& xenos() {
++    static XenosDevice device;
++    return device;
++}
++
++bool XenosDevice::open() {
++    State& s = *state_;
++    if (s.open) {
++        return true;
++    }
++    s.d3d = Direct3DCreate9(D3D_SDK_VERSION);
++    if (s.d3d == nullptr) {
++        return false;
++    }
++    D3DPRESENT_PARAMETERS present{};
++    present.BackBufferWidth = static_cast<UINT>(kFrameWidth);
++    present.BackBufferHeight = static_cast<UINT>(kFrameHeight);
++    present.BackBufferFormat = D3DFMT_A8R8G8B8;
++    present.BackBufferCount = 2u;
++    present.MultiSampleType = static_cast<D3DMULTISAMPLE_TYPE>(kMultisample);
++    present.MultiSampleQuality = 0u;
++    present.SwapEffect = D3DSWAPEFFECT_DISCARD;
++    // A console has no window: the frame goes to the scaler, which fits it to the panel the dashboard selected.
++    present.Windowed = FALSE;
++    present.EnableAutoDepthStencil = TRUE;
++    present.AutoDepthStencilFormat = D3DFMT_D24S8;
++    present.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
++    // The scaler's mode is the platform's (xbox360_platform.cpp); the device only renders 1280x720 into it.
++    if (FAILED(s.d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, nullptr, D3DCREATE_HARDWARE_VERTEXPROCESSING,
++                                   &present, &s.device))) {
++        return false;
++    }
++    if (s.device->GetRenderTarget(0u, &s.color_surface) != D3D_OK) {
++        return false;
++    }
++    // The resolve target: the same size, one sample, the texture the scaler is handed.
++    if (s.device->CreateTexture(static_cast<UINT>(kFrameWidth), static_cast<UINT>(kFrameHeight), 1u,
++                                D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &s.resolved, nullptr) !=
++        D3D_OK) {
++        return false;
++    }
++    s.open = true;
++    x360::log_line(nullptr, "[xenos] device open: %dx%d, %dx multisample, predicated tiling %s", kFrameWidth,
++                   kFrameHeight, kMultisample, kPredicatedTiling ? "on" : "off");
++    return true;
++}
++
++void XenosDevice::close() {
++    State& s = *state_;
++    if (!s.open) {
++        return;
++    }
++    wait_idle();
++    if (s.resolved != nullptr) {
++        s.resolved->Release();
++        s.resolved = nullptr;
++    }
++    if (s.color_surface != nullptr) {
++        s.color_surface->Release();
++        s.color_surface = nullptr;
++    }
++    if (s.device != nullptr) {
++        s.device->Release();
++        s.device = nullptr;
++    }
++    if (s.d3d != nullptr) {
++        s.d3d->Release();
++        s.d3d = nullptr;
++    }
++    s.open = false;
++}
++
++bool XenosDevice::open_ok() const noexcept { return state_->open; }
++
++IDirect3DDevice9* XenosDevice::device() const noexcept { return state_->device; }
++
++IDirect3DTexture9* XenosDevice::resolved_texture() const noexcept { return state_->resolved; }
++
++void XenosDevice::begin_scene_tiles() {
++    State& s = *state_;
++    if (!kPredicatedTiling || s.device == nullptr || s.tiling) {
++        return;
++    }
++    D3DRECT whole{{0, 0, kFrameWidth, kFrameHeight}};
++    if (SUCCEEDED(s.device->BeginTiling(&whole, 0u))) {
++        s.tiling = true;
++    }
++}
++
++void XenosDevice::end_scene_tiles() {
++    State& s = *state_;
++    if (!s.tiling || s.device == nullptr) {
++        return;
++    }
++    s.device->EndTiling(0u);
++    s.tiling = false;
++}
++
++bool XenosDevice::resolve_and_present(bool vsync) {
++    State& s = *state_;
++    if (!s.open) {
++        return false;
++    }
++    if (s.tiling) {
++        end_scene_tiles();
++    }
++    if (SUCCEEDED(s.device->Resolve(D3DRESOLVE_RENDERTARGET0, nullptr, s.resolved, nullptr, 0u, 0u, nullptr, 1.0f,
++                                   0u, nullptr))) {
++        // The scaler presents the resolved texture; at a 60 Hz title Present ties the frame to the panel.
++        (void)vsync;
++        if (s.device->Present(nullptr, nullptr, nullptr, nullptr) == D3DERR_DEVICELOST) {
++            return false;
++        }
++        ++s.presents;
++        return true;
++    }
++    return false;
++}
++
++IDirect3DTexture9* XenosDevice::create_texture(const TextureDesc& desc) const {
++    State& s = *state_;
++    if (!s.open) {
++        return nullptr;
++    }
++    const DWORD usage = desc.render_target ? D3DUSAGE_RENDERTARGET : 0u;
++    IDirect3DTexture9* pTexture = nullptr;
++    if (FAILED(s.device->CreateTexture(desc.width, desc.height, desc.mips, usage, format_of(desc.format),
++                                       D3DPOOL_DEFAULT, &pTexture, nullptr))) {
++        return nullptr;
++    }
++    return pTexture;
++}
++
++bool XenosDevice::upload_texture(IDirect3DTexture9* pTexture, const TextureDesc& desc, const void* rows,
++                                 std::uint32_t pitch) const {
++    State& s = *state_;
++    if (!s.open || pTexture == nullptr || rows == nullptr) {
++        return false;
++    }
++    const std::uint32_t bytes = texel_bytes(desc.format);
++    std::uint32_t width = desc.width;
++    std::uint32_t height = desc.height;
++    const auto* pRows = static_cast<const unsigned char*>(rows);
++    for (std::uint32_t level = 0; level < desc.mips && level < 32u; ++level) {
++        D3DLOCKED_RECT locked{};
++        if (FAILED(pTexture->LockRect(level, &locked, nullptr, 0u))) {
++            return false;
++        }
++        // The blocks of a compressed level are its width and height in 4x4 cells.
++        const bool compressed = bytes == 0u;
++        const std::uint32_t w = compressed ? (width + 3u) / 4u : width;
++        const std::uint32_t h = compressed ? (height + 3u) / 4u : height;
++        const std::uint32_t texel = compressed ? 8u /* a 4x4 block of DXT1 */ : bytes;
++        api::XGSwizzleRect(pRows, pitch, nullptr, locked.pBits, w, h, nullptr, texel);
++        pTexture->UnlockRect(level);
++        // The next level follows the rows of this one.
++        pRows += static_cast<std::size_t>(pitch) * height;
++        width = width > 1u ? width / 2u : 1u;
++        height = height > 1u ? height / 2u : 1u;
++    }
++    return true;
++}
++
++void XenosDevice::wait_idle() {
++    State& s = *state_;
++    if (s.device == nullptr) {
++        return;
++    }
++    IDirect3DQuery9* pQuery = nullptr;
++    if (FAILED(s.device->CreateQuery(D3DQUERYTYPE_EVENT, &pQuery)) || pQuery == nullptr) {
++        return;
++    }
++    if (SUCCEEDED(pQuery->Issue(D3DISSUE_END))) {
++        // The GPU's own mark: the wait ends when it is reached, which is the queue empty.
++        while (pQuery->GetData(nullptr, 0u, D3DGETDATA_FLUSH) == S_FALSE) {
++            Sleep(0);
++        }
++    }
++    pQuery->Release();
++}
++
++std::uint64_t XenosDevice::presents() const noexcept { return state_->presents; }
++
++}  // namespace galaxy::host::x360
++
++#endif  // NEBULA_XBOX360
+diff --git a/platform/xbox360/xenos_device.h b/platform/xbox360/xenos_device.h
+new file mode 100644
+index 0000000..209edf1
+--- /dev/null
++++ b/platform/xbox360/xenos_device.h
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: GPL-3.0-only
++// Xenos: the console's device, its 10 MB of EDRAM, the tile a scene is drawn into, the resolve, and the present that
++// hands the frame to the scaler. The renderer above this (runtime/src/render/) keeps its own command list; this is the
++// device and the swap chain under it, the same role D3D12's device and Vulkan's context play on the other platforms.
++#pragma once
++
++#include <cstdint>
++#include <memory>
++
++#if defined(NEBULA_XBOX360)
++#include <d3d9.h>
++#endif
++
++namespace galaxy::host::x360 {
++
++// What a texture looks like to the uploader: the texel format the frame's shaders sample, the size, and the mips.
++struct TextureDesc {
++    enum class Format : std::uint8_t { Bgra8, Bc1, Bc2, Bc3, Rgba8, R8, Dxt5 };
++    Format format = Format::Bgra8;
++    std::uint32_t width = 0;
++    std::uint32_t height = 0;
++    std::uint32_t mips = 1;
++    bool render_target = false;
++};
++
++class XenosDevice {
++public:
++    XenosDevice();
++    ~XenosDevice();
++    XenosDevice(const XenosDevice&) = delete;
++    XenosDevice& operator=(const XenosDevice&) = delete;
++
++    // Creates the device, the 1280x720 back buffer, the depth buffer and the resolve target the scaler is shown.
++    bool open();
++    void close();
++
++    [[nodiscard]] bool open_ok() const noexcept;
++
++#if defined(NEBULA_XBOX360)
++    [[nodiscard]] IDirect3DDevice9* device() const noexcept;
++    [[nodiscard]] IDirect3DTexture9* resolved_texture() const noexcept;
++#endif
++
++    // A scene larger than the EDRAM holds (colour and depth at 2x multisampling are 14.7 MB of it) is drawn in
++    // predicated tiles: the renderer calls these around its scene passes and the driver clips each one for it.
++    void begin_scene_tiles();
++    void end_scene_tiles();
++
++    // The multisampled target's resolve into `resolved_texture`, then the scaler's present. `vsync` is the frame's
++    // rate tied to the panel's; a 60 Hz title never tears and its frame budget is the period.
++    bool resolve_and_present(bool vsync);
++
++    // A texture the game's own material path can draw: format, size, mips, and the 32x32 tiled layout the Xenos wants
++    // (XGSwizzleRect writes the rows into it; the driver owns the block order).
++#if defined(NEBULA_XBOX360)
++    [[nodiscard]] IDirect3DTexture9* create_texture(const TextureDesc& desc) const;
++    // `rows` is the picture's rows, tightly packed, big-endian, as the cooker wrote them (tools/xbox360/cook.py).
++    bool upload_texture(IDirect3DTexture9* pTexture, const TextureDesc& desc, const void* rows, std::uint32_t pitch) const;
++#endif
++
++    // The device's own wait: the render queue empty before the next frame's targets are rewritten.
++    void wait_idle();
++
++    // Frames the device presented since open(), for the frame limiter and the diagnostics.
++    [[nodiscard]] std::uint64_t presents() const noexcept;
++
++private:
++    struct State;
++    std::unique_ptr<State> state_;
++};
++
++// The device as the renderer's host services see it (runtime/src/render/render_api.cpp's present path).
++[[nodiscard]] XenosDevice& xenos();
++
++}  // namespace galaxy::host::x360

@@ -1,0 +1,16 @@
+# Build output and packages: this repository carries sources, patches and art.
+build/
+dist/
+*.xex
+*.zip
+*.log
+*.wav
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
